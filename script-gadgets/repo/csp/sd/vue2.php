@@ -27,7 +27,7 @@
 	}
 	echo $csp;
 ?>">
-<link href=static/css/app.831a17d7f7f8a55820ed0c1e0d1f1654.css rel=stylesheet></head>
+<link href=../../../third_party/vue/sample-app/static/css/app.831a17d7f7f8a55820ed0c1e0d1f1654.css rel=stylesheet></head>
 <body>
 	<!-- done with https://vuejs.org/v2/guide/installation.html#CLI 
 	npm install -g vue-cli
@@ -39,7 +39,7 @@
 	<?php echo $_GET['inj'] ?>
 	
 	<div id=app></div>
-	<script nonce=random type=text/javascript src=static/js/manifest.08329b2bcb3d9058dc9d.js></script>
-	<script nonce=random type=text/javascript src=static/js/vendor.c7565d5a25692514a74b.js></script>
-	<script nonce=random type=text/javascript src=static/js/app.cd2bce32cc6702496bf0.js></script>
+	<script nonce=random type=text/javascript src=../../../third_party/vue/sample-app/static/js/manifest.08329b2bcb3d9058dc9d.js></script>
+	<script nonce=random type=text/javascript src=../../../third_party/vue/sample-app/static/js/vendor.c7565d5a25692514a74b.js></script>
+	<script nonce=random type=text/javascript src=../../../third_party/vue/sample-app/static/js/app.cd2bce32cc6702496bf0.js></script>
 </body></html>

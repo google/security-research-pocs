@@ -1,0 +1,16 @@
+name: "Vue.js - a sample app."
+description:
+  "A sample app built with Vue framework to demonstrate script gadgets."
+third_party {
+  url {
+    type: HOMEPAGE
+    value: "https://vuejs.org/"
+  }
+  url {
+    type: GIT
+    value: "https://github.com/vuejs/vue"
+  }
+  version: "2.2.5"
+  last_upgrade_date { year: 2017 month: 03 day: 25 }
+  local_modifications: "Only the sample application is bundled here."
+}

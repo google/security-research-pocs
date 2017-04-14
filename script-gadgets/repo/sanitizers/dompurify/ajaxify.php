@@ -11,7 +11,7 @@
 
 <!-- Ajaxify -->
 <script src="//rawgithub.com/browserstate/ajaxify/master/ajaxify-html5.js" nonce="secret"></script>
-<script src="purify.js"></script>
+<script src="../../../third_party/dompurify/purify.js"></script>
 <script nonce="random">
     function getParam(name) {
       var params = location.search.slice(1).split("&");

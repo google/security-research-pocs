@@ -1,0 +1,17 @@
+name: "DOMPurify script"
+description:
+    "DOMPurify - a DOM-only, super-fast, uber-tolerant XSS sanitizer for HTML, MathML and SVG. DOMPurify works with a secure default, but offers a lot of configurability and hooks"
+
+third_party {
+  url {
+    type: HOMEPAGE
+    value: "https://cure53.de/purify/"
+  }
+  url {
+    type: GIT
+    value: "https://github.com/cure53/DOMPurify"
+  }
+  version: "0.8.5"
+  last_upgrade_date { year: 2017 month: 03 day: 01 }
+  local_modifications: "Only the purifying script (src/purify.js) is bundled here."
+}
