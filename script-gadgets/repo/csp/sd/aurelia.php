@@ -32,7 +32,7 @@
 
   <body aurelia-app="main">
   	
-    <script nonce=random src="../../../third_party/aurelia/sample-app/scripts/vendor-bundle.js" data-main="aurelia-bootstrapper"></script>
+    <script nonce=random src="scripts/vendor-bundle.js" data-main="aurelia-bootstrapper"></script>
     <div style="background: red"><?php echo $_GET['inj'] ?> </div>
     <todos></todos>
    </body>
