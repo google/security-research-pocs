@@ -21,6 +21,9 @@
 		case 'ue':
 			$csp = "object-src 'none'; script-src 'nonce-random' 'unsafe-eval' 'self'";
 			break;
+                case 'nonces':
+                        $csp = "object-src 'none'; script-src 'nonce-random' 'self'";
+                        break;
 		case 'wh':
 			$csp = "object-src 'none'; script-src 'self' http://cdn.ractivejs.org";
 			break;	
