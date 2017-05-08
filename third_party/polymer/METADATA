@@ -1,0 +1,17 @@
+name: "Polymer sample app"
+description:
+    "A sample application based on the Polymer framework to demonstrate script gadgets."
+
+third_party {
+  url {
+    type: HOMEPAGE
+    value: "https://www.polymer-project.org/"
+  }
+  url {
+    type: GIT
+    value: "https://github.com/Polymer/polymer"
+  }
+  version: "1.7.1"
+  last_upgrade_date { year: 2017 month: 03 day: 01 }
+  local_modifications: "Just a sample app built with the framework is bundled."
+}

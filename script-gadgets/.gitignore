@@ -3,3 +3,4 @@ repo/csp/sd/static/**
 repo/sanitizers/dompurify/purify.js
 repo/sanitizers/closure/closure-library
 repo/waf/modsecurity/repo
+polymer-start/**

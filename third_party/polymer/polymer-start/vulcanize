@@ -1,0 +1,2 @@
+#!/bin/bash
+vulcanize src/polymer-app/polymer-app.html --inline-script | crisper --html dist/polymer-app.vulcanized.html --js dist/polymer-app.vulcanized.js

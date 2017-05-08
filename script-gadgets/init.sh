@@ -3,6 +3,7 @@
 cp -r ../third_party/aurelia/sample-app/* repo/csp/sd
 cp -r ../third_party/vue/sample-app/* repo/csp/sd
 cp ../third_party/dompurify/purify.js repo/sanitizers/dompurify
+cp -r ../third_party/polymer/polymer-start .
 # Create a symlink for modsecurity pocs.
 ln -sfn ../../../repo repo/waf/modsecurity/repo
 # Prepare closure-library poc

