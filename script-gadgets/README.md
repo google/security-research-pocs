@@ -1,4 +1,8 @@
-This directory hosts proof-of-concept codes accompanying the "Don’t trust the DOM: Bypassing XSS mitigations via Script gadgets" [presentation](http://sebastian-lekies.de/slides/appsec2017.pdf).
+This directory hosts proof-of-concept codes accompanying the "Don’t trust the DOM: Bypassing XSS mitigations via Script gadgets" presentation ([slides](http://sebastian-lekies.de/slides/appsec2017.pdf)).
+
+[![AppSec EU 2017 talk](https://img.youtube.com/vi/p07acPBi-qw/0.jpg)](https://www.youtube.com/watch?v=p07acPBi-qw)
+
+
 
 Authors:
 
