@@ -1,0 +1,1873 @@
+diff --git a/Makefile b/Makefile
+index 73ea23e..b6c7021 100644
+--- a/Makefile
++++ b/Makefile
+@@ -76,10 +76,11 @@ objs = cache.o rfc1035.o util.o option.o forward.o network.o \
+        helper.o tftp.o log.o conntrack.o dhcp6.o rfc3315.o \
+        dhcp-common.o outpacket.o radv.o slaac.o auth.o ipset.o \
+        domain.o dnssec.o blockdata.o tables.o loop.o inotify.o \
+-       poll.o rrfilter.o edns0.o arp.o
++       poll.o rrfilter.o edns0.o arp.o seccomp.o bpf-helper.o \
++       mount-namespace.o seccomp-testing.o
+ 
+ hdrs = dnsmasq.h config.h dhcp-protocol.h dhcp6-protocol.h \
+-       dns-protocol.h radv-protocol.h ip6addr.h
++       dns-protocol.h radv-protocol.h ip6addr.h bpf-helper.h
+ 
+ all : $(BUILDDIR)
+ 	@cd $(BUILDDIR) && $(MAKE) \
+diff --git a/dnsmasq_sandbox_test.py b/dnsmasq_sandbox_test.py
+new file mode 100755
+index 0000000..24f7ffd
+--- /dev/null
++++ b/dnsmasq_sandbox_test.py
+@@ -0,0 +1,398 @@
++#!/usr/bin/python2
++""" dnsmasq is Copyright (c) 2000-2017 Simon Kelley
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 dated June, 1991, or
++   (at your option) version 3 dated 29 June, 2007.
++ 
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++      
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++Tests for dnsmasq_sandbox.
++
++Launch the dnsmasq instance and try to run "dig" with different types.
++
++In case of test failure you can do the following steps to fix the policy error:
++1) Using the syscall number, given by the test, lookup syscall name
++2) Edit the seccomp policy to temporary fully allow this syscall
++3) Run application with strace, e.g. strace -f src/dnsmasq [...]
++4) Using the log from strace, look at the syscall arguments to determine the
++appropriate seccomp policy for it
++5) Either fully allow the syscall or put additional restriction on its
++arguments
++
++The rule of thumb for dealing with arguments is to restrict them as much as
++you can.
++"""
++
++from __future__ import absolute_import
++from __future__ import division
++from __future__ import print_function
++
++import ctypes
++import errno
++import grp
++import os
++import pwd
++import random
++import re
++import shutil
++import signal
++import subprocess
++import time
++
++
++TESTING_DIR = 'dnsmasq_sandbox_testing/'
++LOG_FILE = 'dnsmasq.log'
++CONF_FILE = 'dnsmasq.conf'
++PID_FILE = 'dnsmasq.pid'
++PORT_NUMBER = 8951
++
++CLONE_NEWNET = 0x40000000
++DHCP_IPV4 = '10.0.0.1/24'
++DHCP_RANGEV4 = '10.0.0.2,10.0.0.100,10m'
++DHCP_IPV6 = '1:1:1:1:1:1:1:1/64'
++DHCP_RANGEV6 = '1:1:1:1:1:1:1:2,1:1:1:1:1:1:1:100,10m'
++
++TFTP_ROOT = 'dnsmasq_test_tftp_root'
++TFTP_TEST_FILE = 'test.txt'
++
++# Because of Ubuntu AppArmor policy we have to keep pid file at this location
++DHCLIENT_PID_FILE = '/var/run/dhclient_dnsmasq_testing.pid'
++
++BASE_CONFIG = ('domain-needed\n'
++               'bogus-priv\n'
++               'sandbox=force\n'
++               'sandbox-test\n'
++               'log-facility=%s\n'
++               'pid-file=%s\n'
++               'port=%d\n')
++
++DNSMASQ_PATH = 'src/dnsmasq'
++
++DIG_OPTIONS = ['tcp', 'aaonly', 'adflag', 'cdflag', 'recurse', 'dnssec',
++               'nsid']
++DIG_TYPES = ['A', 'AAAA', 'ANY', 'CNAME', 'MX', 'NS', 'PTR', 'SOA', 'TXT',
++             'A6', 'AFSDB', 'APL', 'ATMA', 'CAA', 'CERT', 'DNAME', 'DNSKEY',
++             'DS', 'EID', 'GID', 'GPOS', 'HINFO', 'ISDN', 'KEY', 'KX', 'LOC',
++             'MB', 'MD', 'MF', 'MG', 'MINFO', 'MR', 'MX', 'NAPTR', 'NIMLOC',
++             'NSEC', 'NSEC3', 'NSEC3PARAM', 'NULL', 'NS', 'NSAP', 'NSAP-PTR',
++             'NXT', 'OPT', 'PTR', 'PX', 'RP', 'RPSIG', 'RT', 'SIG', 'SINK',
++             'SPF', 'SRV', 'SSHFP', 'TKEY', 'TLSA', 'TSIG', 'UID', 'UINFO',
++             'UNSPEC', 'WKS', 'X25']
++
++WEBSITES = ['example.com', 'example.org']
++
++SYSCALL_RE = re.compile(r'Seccomp violation detected. Syscall number = (\d+)')
++
++
++def get_syscall_numbers(s):
++  return set(int(i) for i in SYSCALL_RE.findall(s))
++
++
++class DnsmasqTest(object):
++
++  def __init__(self):
++    cwd = os.getcwd()
++    self.testing_dir = os.path.join(cwd, TESTING_DIR)
++    self.config = ''
++    self.name = 'Test template'
++
++  def _log(self, msg, in_test=True):
++    print(('TEST:' if in_test else '') + msg)
++
++  def _report_error(self, numbers):
++    if not numbers:
++      self._log('dnsmasq error detected. '
++                'Unable to determine bad syscall numbers')
++      return
++    self._log('Seccomp policy violation detected. Bad syscall numbers: %s'
++              % list(numbers))
++
++  def _get_pid(self):
++    try:
++      with open(self.pid_path, 'r') as f:
++        return int(f.read())
++    except (IOError, ValueError):
++      return None
++
++  def _start_dnsmasq(self):
++    self._log('starting dnsmasq instance')
++    with open(os.devnull, 'w') as devnull:
++      dnsmasq = subprocess.Popen([DNSMASQ_PATH, '-C', self.conf_path],
++                                 stdout=devnull,
++                                 stderr=subprocess.PIPE)
++      _, output = dnsmasq.communicate()
++    syscalls = get_syscall_numbers(output)
++    if dnsmasq.returncode != 0 and not syscalls:
++      self._log('dnsmasq died at setup')
++      self._log('return code = %d' % dnsmasq.returncode)
++      self._log('dnsmasq stderr = %s' % output.strip())
++      return 1
++    if syscalls:
++      self._report_error(syscalls)
++      return 1
++    self._log('dnsmasq setup complete')
++    return 0
++
++  def _kill_process(self):
++    pid = self._get_pid()
++    if pid:
++      try:
++        os.kill(pid, signal.SIGTERM)
++        time.sleep(1)
++        os.kill(pid, signal.SIGKILL)
++      except OSError:
++        pass
++
++  def _set_up(self):
++    try:
++      shutil.rmtree(TESTING_DIR)
++    except OSError as e:
++      if e.errno != errno.ENOENT:
++        raise
++    self.log_path = os.path.join(self.testing_dir, LOG_FILE)
++    self.conf_path = os.path.join(self.testing_dir, CONF_FILE)
++    self.pid_path = os.path.join(self.testing_dir, PID_FILE)
++    os.mkdir(TESTING_DIR)
++    # Ensuring, that log file exists and it is empty.
++    with open(self.log_path, 'w'):
++      pass
++    with open(self.conf_path, 'w') as f:
++      f.write(BASE_CONFIG % (self.log_path, self.pid_path, PORT_NUMBER))
++      f.write(self.config)
++
++  def _tear_down(self):
++    self._kill_process()
++    shutil.rmtree(TESTING_DIR)
++
++  def _run_test(self, name, f):
++    self._log('Running test %s' % name, False)
++    self._set_up()
++    result = f()
++    self._tear_down()
++    if not result:
++      self._log('Test %s: OK' % name, False)
++    else:
++      self._log('Test %s: FAILED' % name, False)
++
++  def run(self):
++    self._log('Running test group: %s' % self.name, False)
++    for name in dir(self):
++      if name.startswith('_test_') and callable(getattr(self, name)):
++        self._run_test(name[len('_test_'):], getattr(self, name))
++
++
++class DnsmasqDNSTest(DnsmasqTest):
++
++  def __init__(self):
++    super(DnsmasqDNSTest, self).__init__()
++    self.name = 'DNS seccomp'
++
++  def _set_up(self):
++    super(DnsmasqDNSTest, self)._set_up()
++
++  def _tear_down(self):
++    super(DnsmasqDNSTest, self)._tear_down()
++
++  def _test_dnsmasq_sandbox(self):
++    with open(os.devnull, 'w') as devnull:
++      if self._start_dnsmasq():
++        return 1
++      self._log('starting to run dig')
++      no_reply = 0
++      for dig_type in DIG_TYPES:
++        if no_reply:
++          break
++        self._log('running type = %s' % dig_type)
++        for option in DIG_OPTIONS:
++          url = random.choice(WEBSITES)
++          dig = subprocess.Popen(['dig', '-p', str(PORT_NUMBER), '@localhost',
++                                  '+' + option, '+time=1', '+tries=1', '+noall',
++                                  url, dig_type],
++                                 stdout=devnull,
++                                 stderr=devnull)
++          dig.wait()
++          if dig.returncode == 9:
++            no_reply = 1
++            break
++
++      self._kill_process()
++      with open(self.log_path, 'r') as f:
++        text = f.read()
++      syscalls = get_syscall_numbers(text)
++      if syscalls or no_reply:
++        self._report_error(syscalls)
++        return 1
++      return 0
++
++
++class DnsmasqDHCPTest(DnsmasqTest):
++
++  def __init__(self):
++    super(DnsmasqDHCPTest, self).__init__()
++    self.name = 'DHCP seccomp'
++    self.config = ('interface=veth0\n'
++                   'dhcp-range=%s\n'
++                   'dhcp-range=%s\n'
++                   'dhcp-alternate-port=1067,1068')
++    self.config = self.config % (DHCP_RANGEV4, DHCP_RANGEV6)
++
++  def _set_up(self):
++    super(DnsmasqDHCPTest, self)._set_up()
++    self.dhclient_pid = DHCLIENT_PID_FILE
++    # Setting up network namespace
++    libc = ctypes.CDLL(None, use_errno=True)
++    libc.unshare(CLONE_NEWNET)
++    with open(os.devnull, 'w') as devnull:
++      # Setting up virtual network interfaces
++      subprocess.call(['ip', 'link', 'add', 'veth0', 'type', 'veth', 'peer',
++                       'name', 'veth1'],
++                      stdout=devnull,
++                      stderr=devnull)
++      subprocess.call(['ip', 'link', 'set', 'veth0', 'up'],
++                      stdout=devnull,
++                      stderr=devnull)
++      subprocess.call(['ip', 'link', 'set', 'veth1', 'up'],
++                      stdout=devnull,
++                      stderr=devnull)
++      subprocess.call(['ip', 'addr', 'add', DHCP_IPV4, 'dev', 'veth0'],
++                      stdout=devnull,
++                      stderr=devnull)
++      subprocess.call(['ip', 'addr', 'add', DHCP_IPV6, 'dev', 'veth0'],
++                      stdout=devnull,
++                      stderr=devnull)
++
++  def _test_dhcp_v4(self):
++    if self._start_dnsmasq():
++      return 1
++    self._log('starting to run dhclient')
++    with open(os.devnull, 'w') as devnull:
++      self._log('acquiring lease')
++      subprocess.call(['timeout', '1m', 'dhclient', '-1',
++                       '-pf', self.dhclient_pid, '-p', '1068', 'veth1'],
++                      stdout=devnull,
++                      stderr=devnull)
++      self._log('releasing lease')
++      subprocess.call(['timeout', '1m', 'dhclient', '-r',
++                       '-pf', self.dhclient_pid, '-p', '1068', 'veth1'],
++                      stdout=devnull,
++                      stderr=devnull)
++    self._kill_process()
++    with open(self.log_path, 'r') as f:
++      text = f.read()
++    syscalls = get_syscall_numbers(text)
++    if syscalls:
++      self._report_error(syscalls)
++      return 1
++    return 0
++
++  def _test_dhcp_v6(self):
++    if self._start_dnsmasq():
++      return 1
++    self._log('starting to run dhclient')
++    with open(os.devnull, 'w') as devnull:
++      self._log('acquiring lease')
++      subprocess.call(['timeout', '1m', 'dhclient', '-6', '-1',
++                       '-pf', self.dhclient_pid, 'veth1'],
++                      stdout=devnull,
++                      stderr=devnull)
++      self._log('releasing lease')
++      subprocess.call(['timeout', '1m', 'dhclient', '-6', '-r',
++                       '-pf', self.dhclient_pid, 'veth1'],
++                      stdout=devnull,
++                      stderr=devnull)
++    self._kill_process()
++    with open(self.log_path, 'r') as f:
++      text = f.read()
++    syscalls = get_syscall_numbers(text)
++    if syscalls:
++      self._report_error(syscalls)
++      return 1
++    return 0
++
++  def _tear_down(self):
++    super(DnsmasqDHCPTest, self)._tear_down()
++    try:
++      with open(self.dhclient_pid, 'r') as f:
++        pid = int(f.read())
++    except (IOError, OSError, ValueError):
++      pid = None
++    if pid:
++      try:
++        os.kill(pid, signal.SIGKILL)
++      except OSError:
++        pass
++
++
++class DnsmasqTFTPTest(DnsmasqTest):
++
++  def __init__(self):
++    super(DnsmasqTFTPTest, self).__init__()
++    self.name = 'TFTP seccomp'
++    self.config = ('enable-tftp\n'
++                   'tftp-secure\n'
++                   'tftp-root=%s\n')
++    self.tftp_root = os.path.join(self.testing_dir, TFTP_ROOT)
++    self.config = self.config % self.tftp_root
++
++  def _set_up(self):
++    super(DnsmasqTFTPTest, self)._set_up()
++    nobody_uid = pwd.getpwnam('nobody').pw_uid
++    nogroup_gid = grp.getgrnam('nogroup').gr_gid
++    os.mkdir(self.tftp_root)
++    os.chown(self.tftp_root, nobody_uid, nogroup_gid)
++    self.tftp_root_file = os.path.join(self.tftp_root, TFTP_TEST_FILE)
++    self.tftp_file = os.path.join(self.testing_dir, TFTP_TEST_FILE)
++    with open(self.tftp_root_file, 'w') as f:
++      f.write('test\n')
++    os.chown(self.tftp_root_file, nobody_uid, nogroup_gid)
++
++  def _test_basic_tftp(self):
++    if self._start_dnsmasq():
++      return 1
++    self._log('starting to run tftp client')
++    with open(os.devnull, 'w') as devnull:
++      try:
++        subprocess.call(['busybox', 'tftp', '-g', '-l', self.tftp_file,
++                         '-r', TFTP_TEST_FILE, 'localhost'],
++                        stdout=devnull,
++                        stderr=devnull)
++      except OSError as e:
++        if e.errno != errno.ENOENT:
++          raise
++        self._log('Failed to run tftp client. Perhaps it is not installed?')
++        return 1
++    self._kill_process()
++    with open(self.log_path, 'r') as f:
++      text = f.read()
++    syscalls = get_syscall_numbers(text)
++    if syscalls:
++      self._report_error(syscalls)
++      return 1
++    return 0
++
++  def _tear_down(self):
++    super(DnsmasqTFTPTest, self)._tear_down()
++
++
++def main():
++  test = DnsmasqDNSTest()
++  test.run()
++  test = DnsmasqTFTPTest()
++  test.run()
++  # Since DHCP test enters network namespace and mess up interfaces, we are
++  # doing it last
++  test = DnsmasqDHCPTest()
++  test.run()
++  print('Testing finished')
++
++if __name__ == '__main__':
++  main()
++
+diff --git a/src/bpf-helper.c b/src/bpf-helper.c
+new file mode 100644
+index 0000000..1354988
+--- /dev/null
++++ b/src/bpf-helper.c
+@@ -0,0 +1,96 @@
++/*
++ * Seccomp BPF helper functions
++ *
++ * Copyright (c) 2012 The Chromium OS Authors <chromium-os-dev@chromium.org>
++ * Author: Will Drewry <wad@chromium.org>
++ *
++ * The code may be used by anyone for any purpose,
++ * and can serve as a starting point for developing
++ * applications using prctl(PR_ATTACH_SECCOMP_FILTER).
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "bpf-helper.h"
++
++int bpf_resolve_jumps(struct bpf_labels *labels,
++                      struct sock_filter *filter, size_t count)
++{
++  size_t i;
++
++  if (count < 1 || count > BPF_MAXINSNS)
++    return -1;
++  /*
++  * Walk it once, backwards, to build the label table and do fixups.
++  * Since backward jumps are disallowed by BPF, this is easy.
++  */
++  for (i = 0; i < count; ++i) {
++    size_t offset = count - i - 1;
++    struct sock_filter *instr = &filter[offset];
++    if (instr->code != (BPF_JMP+BPF_JA))
++      continue;
++    switch ((instr->jt<<8)|instr->jf) {
++      case (JUMP_JT<<8)|JUMP_JF:
++        if (labels->labels[instr->k].location == 0xffffffff) {
++          fprintf(stderr, "Unresolved label: '%s'\n",
++                  labels->labels[instr->k].label);
++          return 1;
++        }
++        instr->k = labels->labels[instr->k].location -
++            (offset + 1);
++        instr->jt = 0;
++        instr->jf = 0;
++        continue;
++      case (LABEL_JT<<8)|LABEL_JF:
++        if (labels->labels[instr->k].location != 0xffffffff) {
++          fprintf(stderr, "Duplicate label use: '%s'\n",
++                  labels->labels[instr->k].label);
++          return 1;
++        }
++        labels->labels[instr->k].location = offset;
++        instr->k = 0; /* fall through */
++        instr->jt = 0;
++        instr->jf = 0;
++        continue;
++    }
++  }
++  return 0;
++}
++
++/* Simple lookup table for labels. */
++__u32 seccomp_bpf_label(struct bpf_labels *labels, const char *label)
++{
++  struct __bpf_label *begin = labels->labels, *end;
++  int id;
++
++  if (labels->count == BPF_LABELS_MAX) {
++    fprintf(stderr, "Too many labels\n");
++    exit(1);
++  }
++  if (labels->count == 0) {
++    begin->label = label;
++    begin->location = 0xffffffff;
++    labels->count++;
++    return 0;
++  }
++  end = begin + labels->count;
++  for (id = 0; begin < end; ++begin, ++id) {
++    if (!strcmp(label, begin->label))
++      return id;
++  }
++  begin->label = label;
++  begin->location = 0xffffffff;
++  labels->count++;
++  return id;
++}
++
++void seccomp_bpf_print(struct sock_filter *filter, size_t count)
++{
++  struct sock_filter *end = filter + count;
++  for ( ; filter < end; ++filter)
++    printf("{ code=%u,jt=%u,jf=%u,k=%u },\n",
++           filter->code, filter->jt, filter->jf, filter->k);
++}
++
+diff --git a/src/bpf-helper.h b/src/bpf-helper.h
+new file mode 100644
+index 0000000..e71a128
+--- /dev/null
++++ b/src/bpf-helper.h
+@@ -0,0 +1,268 @@
++/*
++ * Example wrapper around BPF macros.
++ *
++ * Copyright (c) 2012 The Chromium OS Authors <chromium-os-dev@chromium.org>
++ * Author: Will Drewry <wad@chromium.org>
++ *
++ * The code may be used by anyone for any purpose,
++ * and can serve as a starting point for developing
++ * applications using prctl(PR_SET_SECCOMP, 2, ...).
++ *
++ * No guarantees are provided with respect to the correctness
++ * or functionality of this code.
++ */
++#ifndef __BPF_HELPER_H__
++#define __BPF_HELPER_H__
++
++#include <asm/bitsperlong.h>	/* for __BITS_PER_LONG */
++#include <endian.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>	/* for seccomp_data */
++#include <linux/types.h>
++#include <linux/unistd.h>
++#include <stddef.h>
++
++#define BPF_LABELS_MAX 256
++struct bpf_labels {
++  int count;
++  struct __bpf_label {
++    const char *label;
++    __u32 location;
++  } labels[BPF_LABELS_MAX];
++};
++
++int bpf_resolve_jumps(struct bpf_labels *labels,
++                      struct sock_filter *filter, size_t count);
++__u32 seccomp_bpf_label(struct bpf_labels *labels, const char *label);
++void seccomp_bpf_print(struct sock_filter *filter, size_t count);
++
++#define JUMP_JT 0xff
++#define JUMP_JF 0xff
++#define LABEL_JT 0xfe
++#define LABEL_JF 0xfe
++
++#define ALLOW \
++	BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW)
++#define DENY \
++	BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL)
++#define TRAP \
++    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_TRAP)
++#define JUMP(labels, label) \
++	BPF_JUMP(BPF_JMP+BPF_JA, FIND_LABEL((labels), (label)), \
++		 JUMP_JT, JUMP_JF)
++#define LABEL(labels, label) \
++	BPF_JUMP(BPF_JMP+BPF_JA, FIND_LABEL((labels), (label)), \
++		 LABEL_JT, LABEL_JF)
++#define SYSCALL(nr, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (nr), 0, 1), \
++	jt
++
++/* Lame, but just an example */
++#define FIND_LABEL(labels, label) seccomp_bpf_label((labels), #label)
++
++#define EXPAND(...) __VA_ARGS__
++
++/* Ensure that we load the logically correct offset. */
++#if __BYTE_ORDER == __LITTLE_ENDIAN
++#define LO_ARG(idx) offsetof(struct seccomp_data, args[(idx)])
++#elif __BYTE_ORDER == __BIG_ENDIAN
++#define LO_ARG(idx) offsetof(struct seccomp_data, args[(idx)]) + sizeof(__u32)
++#else
++#error "Unknown endianness"
++#endif
++
++/* Map all width-sensitive operations */
++#if __BITS_PER_LONG == 32
++
++#define JEQ(x, jt) JEQ32(x, EXPAND(jt))
++#define JNE(x, jt) JNE32(x, EXPAND(jt))
++#define JGT(x, jt) JGT32(x, EXPAND(jt))
++#define JLT(x, jt) JLT32(x, EXPAND(jt))
++#define JGE(x, jt) JGE32(x, EXPAND(jt))
++#define JLE(x, jt) JLE32(x, EXPAND(jt))
++#define JA(x, jt) JA32(x, EXPAND(jt))
++#define ARG(i) ARG_32(i)
++
++#elif __BITS_PER_LONG == 64
++
++/* Ensure that we load the logically correct offset. */
++#if __BYTE_ORDER == __LITTLE_ENDIAN
++#define ENDIAN(_lo, _hi) _lo, _hi
++#define HI_ARG(idx) offsetof(struct seccomp_data, args[(idx)]) + sizeof(__u32)
++#elif __BYTE_ORDER == __BIG_ENDIAN
++#define ENDIAN(_lo, _hi) _hi, _lo
++#define HI_ARG(idx) offsetof(struct seccomp_data, args[(idx)])
++#endif
++
++union arg64 {
++	struct {
++		__u32 ENDIAN(lo32, hi32);
++	};
++	__u64 u64;
++};
++
++#define JEQ(x, jt) \
++	JEQ64(((union arg64){.u64 = (x)}).lo32, \
++	      ((union arg64){.u64 = (x)}).hi32, \
++	      EXPAND(jt))
++#define JGT(x, jt) \
++	JGT64(((union arg64){.u64 = (x)}).lo32, \
++	      ((union arg64){.u64 = (x)}).hi32, \
++	      EXPAND(jt))
++#define JGE(x, jt) \
++	JGE64(((union arg64){.u64 = (x)}).lo32, \
++	      ((union arg64){.u64 = (x)}).hi32, \
++	      EXPAND(jt))
++#define JNE(x, jt) \
++	JNE64(((union arg64){.u64 = (x)}).lo32, \
++	      ((union arg64){.u64 = (x)}).hi32, \
++	      EXPAND(jt))
++#define JLT(x, jt) \
++	JLT64(((union arg64){.u64 = (x)}).lo32, \
++	      ((union arg64){.u64 = (x)}).hi32, \
++	      EXPAND(jt))
++#define JLE(x, jt) \
++	JLE64(((union arg64){.u64 = (x)}).lo32, \
++	      ((union arg64){.u64 = (x)}).hi32, \
++	      EXPAND(jt))
++
++#define JA(x, jt) \
++	JA64(((union arg64){.u64 = (x)}).lo32, \
++	       ((union arg64){.u64 = (x)}).hi32, \
++	       EXPAND(jt))
++#define ARG(i) ARG_64(i)
++
++#else
++#error __BITS_PER_LONG value unusable.
++#endif
++
++/* Loads the arg into A */
++#define ARG_32(idx) \
++	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, LO_ARG(idx))
++
++/* Loads lo into M[0] and hi into M[1] and A */
++#define ARG_64(idx) \
++	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, LO_ARG(idx)), \
++	BPF_STMT(BPF_ST, 0), /* lo -> M[0] */ \
++	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, HI_ARG(idx)), \
++	BPF_STMT(BPF_ST, 1) /* hi -> M[1] */
++
++#define JEQ32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (value), 0, 1), \
++	jt
++
++#define JNE32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (value), 1, 0), \
++	jt
++
++#define JA32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JSET+BPF_K, (value), 0, 1), \
++	jt
++
++#define JGE32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, (value), 0, 1), \
++	jt
++
++#define JGT32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, (value), 0, 1), \
++	jt
++
++#define JLE32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, (value), 1, 0), \
++	jt
++
++#define JLT32(value, jt) \
++	BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, (value), 1, 0), \
++	jt
++
++/*
++ * All the JXX64 checks assume lo is saved in M[0] and hi is saved in both
++ * A and M[1]. This invariant is kept by restoring A if necessary.
++ */
++#define JEQ64(lo, hi, jt) \
++	/* if (hi != arg.hi) goto NOMATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (hi), 0, 5), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), /* swap in lo */ \
++	/* if (lo != arg.lo) goto NOMATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (lo), 0, 2), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define JNE64(lo, hi, jt) \
++	/* if (hi != arg.hi) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (hi), 0, 3), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), \
++	/* if (lo != arg.lo) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (lo), 2, 0), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define JA64(lo, hi, jt) \
++	/* if (hi & arg.hi) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JSET+BPF_K, (hi), 3, 0), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), \
++	/* if (lo & arg.lo) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JSET+BPF_K, (lo), 0, 2), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define JGE64(lo, hi, jt) \
++	/* if (hi > arg.hi) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, (hi), 4, 0), \
++	/* if (hi != arg.hi) goto NOMATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (hi), 0, 5), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), \
++	/* if (lo >= arg.lo) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, (lo), 0, 2), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define JGT64(lo, hi, jt) \
++	/* if (hi > arg.hi) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, (hi), 4, 0), \
++	/* if (hi != arg.hi) goto NOMATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (hi), 0, 5), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), \
++	/* if (lo > arg.lo) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, (lo), 0, 2), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define JLE64(lo, hi, jt) \
++	/* if (hi < arg.hi) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, (hi), 0, 4), \
++	/* if (hi != arg.hi) goto NOMATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (hi), 0, 5), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), \
++	/* if (lo <= arg.lo) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGT+BPF_K, (lo), 2, 0), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define JLT64(lo, hi, jt) \
++	/* if (hi < arg.hi) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, (hi), 0, 4), \
++	/* if (hi != arg.hi) goto NOMATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, (hi), 0, 5), \
++	BPF_STMT(BPF_LD+BPF_MEM, 0), \
++	/* if (lo < arg.lo) goto MATCH; */ \
++	BPF_JUMP(BPF_JMP+BPF_JGE+BPF_K, (lo), 2, 0), \
++	BPF_STMT(BPF_LD+BPF_MEM, 1), \
++	jt, \
++	BPF_STMT(BPF_LD+BPF_MEM, 1)
++
++#define LOAD_SYSCALL_NR \
++	BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
++		 offsetof(struct seccomp_data, nr))
++#define LOAD_ARCH \
++        BPF_STMT(BPF_LD+BPF_W+BPF_ABS, \
++                 offsetof(struct seccomp_data, arch))
++
++#endif  /* __BPF_HELPER_H__ */
++
+diff --git a/src/config.h b/src/config.h
+index 4c03e2c..3f5ef52 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -180,6 +180,7 @@ RESOLVFILE
+ /* #define HAVE_LIBIDN2 */
+ /* #define HAVE_CONNTRACK */
+ /* #define HAVE_DNSSEC */
++/* #define HAVE_SECCOMP */
+ 
+ 
+ /* Default locations for important system files. */
+@@ -232,6 +233,10 @@ HAVE_GETOPT_LONG
+ 
+ HAVE_SOCKADDR_SA_LEN
+    defined if struct sockaddr has sa_len field (*BSD) 
++
++HAVE_SECCOMP
++   defined if seccomp-bpf and mount namespaces Linux-only features are
++   available, to enable the sandbox code.
+ */
+ 
+ /* Must precede __linux__ since uClinux defines __linux__ too. */
+@@ -265,6 +270,10 @@ HAVE_SOCKADDR_SA_LEN
+ #elif defined(__linux__)
+ #define HAVE_LINUX_NETWORK
+ #define HAVE_GETOPT_LONG
++#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
++    defined(__arm__) || defined(__powerpc__)
++#define HAVE_SECCOMP
++#endif
+ #undef HAVE_SOCKADDR_SA_LEN
+ 
+ #elif defined(__FreeBSD__) || \
+@@ -365,6 +374,10 @@ HAVE_SOCKADDR_SA_LEN
+ #undef HAVE_LOOP
+ #endif
+ 
++#ifdef NO_SECCOMP
++#undef HAVE_SECCOMP
++#endif
++
+ #if defined (HAVE_LINUX_NETWORK) && !defined(NO_INOTIFY)
+ #define HAVE_INOTIFY
+ #endif
+@@ -443,6 +456,10 @@ static char *compile_opts =
+ "no-"
+ #endif
+ "DNSSEC "
++#ifndef HAVE_SECCOMP
++"no-"
++#endif
++"SECCOMP "
+ #ifdef NO_ID
+ "no-ID "
+ #endif
+diff --git a/src/dnsmasq.c b/src/dnsmasq.c
+index 771bec1..79562b3 100644
+--- a/src/dnsmasq.c
++++ b/src/dnsmasq.c
+@@ -67,7 +67,6 @@ int main (int argc, char **argv)
+   bindtextdomain("dnsmasq", LOCALEDIR); 
+   textdomain("dnsmasq");
+ #endif
+-
+   sigact.sa_handler = sig_handler;
+   sigact.sa_flags = 0;
+   sigemptyset(&sigact.sa_mask);
+@@ -87,7 +86,27 @@ int main (int argc, char **argv)
+   rand_init(); /* Must precede read_opts() */
+   
+   read_opts(argc, argv, compile_opts);
+- 
++
++  /* Enabling sandbox */
++#ifndef HAVE_SECCOMP
++  if (!option_bool(OPT_NO_SANDBOX) && option_bool(OPT_SANDBOX_FORCE))
++  {
++    die(_("Seccomp not available: see HAVE_SECCOMP in src/config.h"), NULL, EC_BADCONF);
++  }
++#else
++  if (!option_bool(OPT_NO_SANDBOX))
++  {
++    if (setup_mount_namespace(daemon) && option_bool(OPT_SANDBOX_FORCE))
++    {
++      die(_("mount namespace initialization failed"), NULL, EC_MISC);
++    }
++    if (setup_seccomp(daemon) && option_bool(OPT_SANDBOX_FORCE))
++    {
++      die(_("seccomp initialization failed"), NULL, EC_MISC);
++    }
++  }
++#endif
++
+   if (daemon->edns_pktsz < PACKETSZ)
+     daemon->edns_pktsz = PACKETSZ;
+ 
+diff --git a/src/dnsmasq.h b/src/dnsmasq.h
+index 24dda08..ae85dc9 100644
+--- a/src/dnsmasq.h
++++ b/src/dnsmasq.h
+@@ -239,7 +239,10 @@ struct event_desc {
+ #define OPT_MAC_B64        54
+ #define OPT_MAC_HEX        55
+ #define OPT_TFTP_APREF_MAC 56
+-#define OPT_LAST           57
++#define OPT_NO_SANDBOX     57
++#define OPT_SANDBOX_FORCE  58
++#define OPT_SANDBOX_TEST   59
++#define OPT_LAST           60
+ 
+ /* extra flags for my_syslog, we use a couple of facilities since they are known 
+    not to occupy the same bits as priorities, no matter how syslog.h is set up. */
+@@ -1558,3 +1561,19 @@ int check_source(struct dns_header *header, size_t plen, unsigned char *pseudohe
+ /* arp.c */
+ int find_mac(union mysockaddr *addr, unsigned char *mac, int lazy, time_t now);
+ int do_arp_script_run(void);
++
++/* seccomp.c */
++#ifdef HAVE_SECCOMP
++int setup_seccomp(struct daemon *daemon);
++#endif
++
++/* seccomp-testing.c */
++#ifdef HAVE_SECCOMP
++int setup_seccomp_testing();
++#endif
++
++/* mount-namespace.c */
++#ifdef HAVE_SECCOMP
++int setup_mount_namespace(struct daemon *daemon);
++#endif
++
+diff --git a/src/mount-namespace.c b/src/mount-namespace.c
+new file mode 100644
+index 0000000..c3a6f8e
+--- /dev/null
++++ b/src/mount-namespace.c
+@@ -0,0 +1,387 @@
++/* dnsmasq is Copyright (c) 2000-2017 Simon Kelley
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 dated June, 1991, or
++   (at your option) version 3 dated 29 June, 2007.
++ 
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++      
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/* Using linux mount namespace implementation to limit dnsmasq access to files.
++
++   Basically, we create a copy of the file tree in /tmp, including only files
++   and directories, necessary for the dnsmasq, mount them to their
++   versions in the original file tree and then do pivot_root into this folder
++   to prevent possible escapes. While seccomp restrict syscalls, a mount
++   namespace complements this by restricting which files can be read and
++   modified on the filesystem, so we end up with a robust sandbox.
++   Also we create a copy of our cwd in our fake tree and chdir into it later,
++   so all relative links still work.
++
++   We use mount namespaces, so all mount operations we do to establish our
++   sandbox, doesn't affect anything outside dnsmasq process.
++
++   If you want to add a file or directory there are two possibilities:
++   1) The file or directory only need to exist, doesn't hold any data on the
++      beginning and you don't need to save the data between dnsmasq launches.
++      Then you use: create_sandbox_dir / create_sandbox_file.
++      Examples:
++        create_sandbox_file("/tmp/dnsmasq_tmp_cache")
++        create_sandbox_dir(cwd)  // to chdir into it later, we don't really
++        need its content.
++   2) You need the contents of the file/dir to be reachable by application.
++      Then you use: mount_dir / mount_file.
++      Examples:
++        mount_dir("/var/dnsmasq/hosts_file_directory")
++        mount_file("/etc/resolv.conf") */
++
++#include "dnsmasq.h"
++
++#ifdef HAVE_SECCOMP
++
++#include <sched.h>
++#include <libgen.h>
++#include <sys/mount.h>
++#include <sys/syscall.h>
++
++#define MOUNT_ROOT "/tmp/dnsmasq.sandbox"
++#define MOUNT_FILE 0
++#define MOUNT_DIR  1
++
++static char *cwd;
++
++static char* join_paths(char *first, char *second)
++{
++  /* +2 for null byte and slash, that may be added */
++  char *result = safe_malloc(strlen(first) + strlen(second) + 2);
++  result[0] = '\0';
++  strcat(result, first);
++  /* so join_paths("/folder", "file") works correctly */
++  if (second[0] && second[0] != '/')
++    strcat(result, "/");
++  strcat(result, second);
++  return result;
++}
++
++static char* make_absolute_path(char *path)
++{
++  /* +2 for null byte and slash, that may be added */
++  char *absolute_path = safe_malloc(strlen(cwd) + strlen(path) + 2);
++  absolute_path[0] = '\0';
++  if (path[0] != '/')
++  {
++    strcat(absolute_path, cwd);
++    strcat(absolute_path, "/");
++  }
++  strcat(absolute_path, path);
++  return absolute_path;
++}
++
++static char* clean_path(char *path)
++{
++  /* +2 for null byte and slash, that may be added */
++  char *result = safe_malloc(strlen(path) + 2);
++  result[0] = '\0';
++  char *absolute_path = make_absolute_path(path);
++
++  char *token = strtok(absolute_path, "/");
++  while (token != NULL)
++  {
++    /* If token = ".." remove the last part from the result */
++    if (strcmp(token, "..") == 0)
++    {
++      char *p = strrchr(result, '/');
++      if (p)
++        *p = '\0';
++    }
++    /* If token is just a label append it to result */
++    else if (*token && strcmp(token, ".") != 0)
++    {
++      strcat(result, "/");
++      strcat(result, token);
++    }
++    token = strtok(NULL, "/");
++  }
++  free(absolute_path);
++  if (*result == '\0')
++  {
++    strcat(result, "/");
++  }
++  return result;
++}
++
++static char* path_host_to_sandbox(char *path)
++{
++  char *cleaned_path = clean_path(path);
++  char *sandbox_path = join_paths(MOUNT_ROOT, cleaned_path);
++  free(cleaned_path);
++  return sandbox_path;
++}
++
++static void create_dirs(char *path)
++{
++  if (*path == '\0')
++    return;
++  char *p = NULL;
++  for (p = path + 1; *p; ++p)
++  {
++    if (*p == '/')
++    {
++      *p = '\0';
++      if (mkdir(path, 0755) && errno != EEXIST)
++      {
++        die(_("unable to create %s directory"), path, EC_FILE);
++      }
++      *p = '/';
++    }
++  }
++  if (mkdir(path, 0755) && errno != EEXIST)
++  {
++    die(_("unable to create %s directory"), path, EC_FILE);
++  }
++}
++
++static void create_file(char *path)
++{
++  int fd;
++  if ((fd = creat(path, 0664)) == -1)
++  {
++    die(_("unable to create %s file"), path, EC_FILE);
++  }
++  close(fd);
++}
++
++static void create_sandbox_dir(char *path)
++{
++  char *sandbox_path = path_host_to_sandbox(path);
++  create_dirs(sandbox_path);
++  free(sandbox_path);
++}
++
++static void create_sandbox_file(char *path)
++{
++  char *sandbox_path = path_host_to_sandbox(path);
++  char* p = strrchr(sandbox_path, '/');
++  *p = '\0';
++  create_dirs(sandbox_path);
++  *p = '/';
++  create_file(sandbox_path);
++  free(sandbox_path);
++}
++
++static void mount_path(char *path)
++{
++  char *sandbox_path = path_host_to_sandbox(path);
++  if (mount(path, sandbox_path, NULL, MS_BIND|MS_REC, NULL))
++  {
++    /* It's okay to fail mount operation if path doesn't exists.
++       If dnsmasq later crashed, because of lack of this file/dir, it would have
++       crashed even without mount namespace, so ignoring ENOENT and ENOTDIR
++       errors.*/
++    if (errno != ENOENT && errno != ENOTDIR)
++    {
++      die(_("unable to bind mount %s"), path, EC_FILE);
++    }
++    else
++    {
++      if (remove(sandbox_path))
++      {
++        die(_("unable to clean up %s after mount failure"), sandbox_path, EC_FILE);
++      }
++    }
++  }
++  free(sandbox_path);
++}
++
++static void mount_dir(char *path)
++{
++  create_sandbox_dir(path);
++  mount_path(path);
++}
++
++static void mount_file(char *path)
++{
++  create_sandbox_file(path);
++  mount_path(path);
++}
++
++static int prepare_mount_namespace()
++{
++  if (mkdir(MOUNT_ROOT, 0755) && errno != EEXIST)
++  {
++    die(_("failed to create %s directory."), MOUNT_ROOT, EC_FILE);
++  }
++  if (unshare(CLONE_NEWNS))
++  {
++    if (errno == EPERM)
++      die(_("unshare syscall failed, maybe you lack CAP_SYS_ADMIN"), NULL, EC_MISC);
++    /* Aborting process without crash, so if --sandbox=try, we will
++       just carry on. */
++    return 1;
++  }
++  /* Put MOUNT_PRIVATE flag on all mount points, so our changes won't affect the
++     original namespace. */
++  if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL))
++  {
++    die(_("failed to set all mount points to private"), NULL, EC_FILE);
++  }
++  /* Mounting tmpfs over MOUNT_ROOT. Since tmpfs size is dynamic and
++     size option just specify the upper border, we can put it rather high.*/
++  if (mount("none", MOUNT_ROOT, "tmpfs", 0, "size=1G"))
++  {
++    die(_("failed to create tmpfs on %s"), MOUNT_ROOT, EC_FILE);
++  }
++  if (!(cwd = getcwd(NULL, 0)))
++  {
++    die(_("unable to get current working directory"), NULL, EC_FILE);
++  }
++  return 0;
++}
++
++static void enter_pivot_root()
++{
++  if (chdir(MOUNT_ROOT))
++  {
++    die(_("unable to chdir into %s"), MOUNT_ROOT, EC_FILE);
++  }
++  /* Doing pivot_root to finalize namespace creation */
++  if (syscall(__NR_pivot_root, MOUNT_ROOT, MOUNT_ROOT))
++  {
++    die(_("pivot root failed\n"), NULL, EC_MISC);
++  }
++  if (umount2("/", MNT_DETACH))
++  {
++    die(_("old root MNT_DETACH failed"), NULL, EC_MISC);
++  }
++  /* Namespace setup complete. Returning to our working directory. */
++  if (chdir(cwd))
++  {
++    die(_("unable to chdir back into %s"), cwd, EC_FILE);
++  }
++  free(cwd);
++}
++
++int setup_mount_namespace(struct daemon *daemon)
++{
++  if (prepare_mount_namespace())
++  {
++    return 1;
++  }
++  /* Do all mount_dir here. */
++  struct hostsfile *ah; /* --hostsdir */
++  for (ah = daemon->dynamic_dirs; ah; ah = ah->next)
++  {
++    mount_dir(ah->fname);
++  }
++
++  /* --tftp_root */
++  if (daemon->tftp_prefix)
++    mount_dir(daemon->tftp_prefix);
++  struct tftp_prefix *pref;
++  for (pref = daemon->if_prefix; pref; pref = pref->next)
++    mount_dir(pref->prefix);
++
++  /* --pid_file */
++  if (daemon->runfile)
++  {
++    char *absolute_runfile = clean_path(daemon->runfile);
++    mount_dir(dirname(absolute_runfile));
++    free(absolute_runfile);
++  }
++
++  mount_dir("/proc/sys/net/ipv6/conf"); /* used in radv.c:412 */
++  mount_dir("/lib"); /* used for dynamic linking */
++  mount_dir("/lib64"); /* used for dynamic linking */
++
++  /* Do all mount_file here. */
++  /* --resolv_file */
++  struct resolvc *res;
++  for (res = daemon->resolv_files; res; res = res->next)
++  {
++    mount_file(res->name);
++  }
++  /* --addn-hosts */
++  for (ah = daemon->addn_hosts; ah; ah = ah->next)
++  {
++    mount_file(ah->fname);
++  }
++#ifdef DNSSEC
++  /* --dnssec-timestamp */
++  if (daemon->timestamp_file)
++  {
++    char *absolute_timestamp = clean_path(daemon->timestamp_file);
++    create_sandbox_dir(dirname(absolute_timestamp));
++    free(absolute_timestamp);
++  }
++#endif
++  /* --dhcp-hostsfile */
++  for (ah = daemon->dhcp_hosts_file; ah; ah = ah->next)
++  {
++    mount_file(ah->fname);
++  }
++  /* --dhcp-opts-file */
++  for (ah = daemon->dhcp_opts_file; ah; ah = ah->next)
++  {
++    mount_file(ah->fname);
++  }
++  /* --read-ethers */
++  if (!access(ETHERSFILE, F_OK))
++  {
++    mount_file(ETHERSFILE);
++  }
++  /* --log-facility */
++  if (daemon->log_file && strcmp(daemon->log_file, "-") != 0)
++  {
++    mount_file(daemon->log_file);
++  }
++  /* --dhcp-leasefile */
++  {
++    /* if daemon->lease_file is NULL, create LEASEFILE */
++    char *lease_file = NULL;
++    if (daemon->lease_file)
++      lease_file = daemon->lease_file;
++    else
++      lease_file = LEASEFILE;
++    char *absolute_lease_file = clean_path(lease_file);
++    mount_dir(dirname(absolute_lease_file));
++    free(absolute_lease_file);
++  }
++  /* --dhcp-luascript */
++  if (daemon->luascript)
++  {
++    mount_file(daemon->luascript);
++  }
++  /* --dhcp-script */
++  if (daemon->lease_change_command)
++  {
++    mount_file(daemon->lease_change_command);
++  }
++  /* --servers-file */
++  if (daemon->servers_file)
++    mount_file(daemon->servers_file);
++  mount_file("/etc/passwd"); /* used in dnsmasq.c:418 */
++  mount_file("/etc/group"); /* used in --group option */
++  mount_file("/dev/null"); /* used in dnsmasq.c:582 */
++  mount_file("/etc/localtime"); /* used by logging facility */
++  mount_file(RANDFILE); /* used in util.c:42 */
++  mount_file(HOSTSFILE); /* used in cache.c:1129 */
++  mount_file(ETHERSFILE); /* used in dhcp.c:802 */
++  mount_file("/dev/log"); /* used internally */
++  mount_file("/etc/nsswitch.conf"); /* used internally */
++  mount_file("/var/run/nscd/socket"); /* used internally */
++
++  create_sandbox_dir(cwd); /* recreate our cwd in mount namespace to chdir into it later */
++
++  enter_pivot_root();
++  return 0;
++}
++
++#endif /* HAVE_SECCOMP */
++
+diff --git a/src/option.c b/src/option.c
+index 6a14c4d..d946ccd 100644
+--- a/src/option.c
++++ b/src/option.c
+@@ -160,7 +160,9 @@ struct myoption {
+ #define LOPT_DHCPTTL       348
+ #define LOPT_TFTP_MTU      349
+ #define LOPT_REPLY_DELAY   350
+- 
++#define LOPT_SANDBOX       351
++#define LOPT_SANDBOX_TEST  352
++
+ #ifdef HAVE_GETOPT_LONG
+ static const struct option opts[] =  
+ #else
+@@ -325,6 +327,8 @@ static const struct myoption opts[] =
+     { "script-arp", 0, 0, LOPT_SCRIPT_ARP },
+     { "dhcp-ttl", 1, 0 , LOPT_DHCPTTL },
+     { "dhcp-reply-delay", 1, 0, LOPT_REPLY_DELAY },
++    { "sandbox", 1, 0, LOPT_SANDBOX },
++    { "sandbox-test", 0, 0, LOPT_SANDBOX_TEST },
+     { NULL, 0, 0, 0 }
+   };
+ 
+@@ -497,6 +501,8 @@ static struct {
+   { LOPT_IGNORE_ADDR, ARG_DUP, "<ipaddr>", gettext_noop("Ignore DNS responses containing ipaddr."), NULL }, 
+   { LOPT_DHCPTTL, ARG_ONE, "<ttl>", gettext_noop("Set TTL in DNS responses with DHCP-derived addresses."), NULL }, 
+   { LOPT_REPLY_DELAY, ARG_ONE, "<integer>", gettext_noop("Delay DHCP replies for at least number of seconds."), NULL },
++  { LOPT_SANDBOX, ARG_ONE, "[=try|force|disable]", gettext_noop("Enable syscall sandbox with Linux seccomp-bpf and mount namespace"), NULL },
++  { LOPT_SANDBOX_TEST, OPT_SANDBOX_TEST, NULL, gettext_noop("Generate catchable SIGSYS signal on policy violation."), NULL },
+   { 0, 0, NULL, NULL, NULL }
+ }; 
+ 
+@@ -4172,7 +4178,19 @@ err:
+ 	break;
+       }
+ #endif
+-		
++
++    case LOPT_SANDBOX: /* --sandbox */
++      /* default action is sandbox=try */
++      if (strcasecmp(arg, "force") == 0)
++      {
++        set_option_bool(OPT_SANDBOX_FORCE);
++      }
++      else if (strcasecmp(arg, "disable") == 0)
++      {
++        set_option_bool(OPT_NO_SANDBOX);
++      }
++      break;
++
+     default:
+       ret_err(_("unsupported option (check that dnsmasq was compiled with DHCP/TFTP/DNSSEC/DBus support)"));
+       
+diff --git a/src/seccomp-testing.c b/src/seccomp-testing.c
+new file mode 100644
+index 0000000..cf3d6f0
+--- /dev/null
++++ b/src/seccomp-testing.c
+@@ -0,0 +1,56 @@
++/* dnsmasq is Copyright (c) 2000-2017 Simon Kelley
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 dated June, 1991, or
++   (at your option) version 3 dated 29 June, 2007.
++ 
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++      
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/* Adding handler for SIGSYS signal for dnsmasq_sandbox_testing.py to catch
++   later */
++
++#include "dnsmasq.h"
++
++#ifdef HAVE_SECCOMP
++
++/* helper to silence unused argument warning */
++#define UNUSED(x) (void)x
++#ifndef SYS_SECCOMP
++#define SYS_SECCOMP 1
++#endif
++
++#include <signal.h>
++
++void sigsys_handler(int sig, siginfo_t *info, void *ucontext)
++{
++  UNUSED(ucontext);
++  /* Catching SIGSYS with si_code == SYS_SECCOMP */
++  if (sig == SIGSYS && info->si_code == SYS_SECCOMP)
++  {
++    /* At the beginning, syslog is not setup. Later, stderr is closed.
++       Therefore, log to both to make sure the error is seen. */
++    fprintf(stderr, "Seccomp violation detected. Syscall number = %d\n", info->si_syscall);
++    my_syslog(LOG_ERR, "Seccomp violation detected. Syscall number = %d", info->si_syscall);
++  }
++  exit(1);
++}
++
++int setup_seccomp_testing()
++{
++  struct sigaction sigact;
++  sigact.sa_sigaction = sigsys_handler;
++  sigact.sa_flags = SA_SIGINFO;
++  sigemptyset(&sigact.sa_mask);
++  return sigaction(SIGSYS, &sigact, NULL);
++}
++
++#endif /* HAVE_SECCOMP */
++
+diff --git a/src/seccomp.c b/src/seccomp.c
+new file mode 100644
+index 0000000..2c8023e
+--- /dev/null
++++ b/src/seccomp.c
+@@ -0,0 +1,427 @@
++/* dnsmasq is Copyright (c) 2000-2017 Simon Kelley
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 dated June, 1991, or
++   (at your option) version 3 dated 29 June, 2007.
++ 
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++      
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/* Using seccomp-bpf filter to restrict application syscalls.
++
++   A seccomp policy is created below to allow only subset of syscalls, which
++   program used. Is case it is possible, arguments of the syscall are also
++   filtered to harden the policy.
++   For example we only allow F_GETFL and F_SETFL mode to fcntl syscall.
++   A bpf-helper.h macros are used to improve policy readability
++
++   When adding new syscalls to the policy, it is adviced to put it in
++   corresponding category of the policy, or to create your own category if
++   necessary.*/
++
++#include "dnsmasq.h"
++
++#ifdef HAVE_SECCOMP
++
++#include "bpf-helper.h"
++#include <linux/audit.h>
++#include <linux/sched.h>
++#include <linux/netlink.h>
++#include <sys/prctl.h>
++#include <sys/mman.h>
++#include <netinet/icmp6.h>
++
++#ifdef __x86_64__
++#include <asm/prctl.h>
++#endif
++
++#if !defined(__NR_seccomp) && defined(__x86_64__)
++#define __NR_seccomp 317
++#elif !defined(__NR_seccomp) && defined(__i386__)
++#define __NR_seccomp 354
++#elif !defined(__NR_seccomp) && defined(__aarch64__)
++#define __NR_seccomp 277
++#elif !defined(__NR_seccomp) && defined(__arm__)
++#define __NR_seccomp 383
++#elif !defined(__NR_seccomp) && defined(__powerpc__)
++#define __NR_seccomp 358
++#elif !defined(__NR_seccomp)
++#warning Seccomp syscall is not defined for this architecture
++#endif
++
++#if defined(__x86_64__)
++#define ARCH_NR AUDIT_ARCH_X86_64
++#elif defined(__i386__)
++#define ARCH_NR AUDIT_ARCH_I386
++#elif defined(__aarch64__)
++#define ARCH_NR AUDIT_ARCH_AARCH64
++#elif defined(__arm__)
++#define ARCH_NR AUDIT_ARCH_ARM
++#elif defined(__powerpc__)
++#define ARCH_NR AUDIT_ARCH_PPC
++#endif
++
++
++int setup_seccomp(struct daemon *daemon)
++{
++#if defined(__NR_seccomp)
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
++    {
++      return 1;
++    }
++    struct sock_filter trap_instruction = TRAP;
++    struct sock_filter ret_error_instruction = DENY;
++    if (option_bool(OPT_SANDBOX_TEST))
++    {
++      if (setup_seccomp_testing())
++      {
++        die(_("Failed to setup seccomp testing"), NULL, EC_MISC);
++      }
++      /* TRAP is an initializer list, so we can't just assign them
++         directly. */
++      ret_error_instruction = trap_instruction;
++    }
++
++    struct bpf_labels l = {.count = 0};
++    struct sock_filter filter[] = {
++      LOAD_ARCH,
++      JEQ32(ARCH_NR, JUMP(&l, arch_check_ok_l)),
++      /* If not compiled as the same arch as we are running as,
++         the syscall number used in the policy will be incorrect
++         which could allow for sandbox escapes */
++      ret_error_instruction,
++      LABEL(&l, arch_check_ok_l),
++
++      LOAD_SYSCALL_NR,
++
++      /* ptrace is too much attack surface */
++      SYSCALL(__NR_ptrace, ret_error_instruction),
++
++      /* Networking */
++      SYSCALL(__NR_bind, ALLOW),
++      SYSCALL(__NR_connect, ALLOW),
++      SYSCALL(__NR_getsockname, ALLOW),
++      SYSCALL(__NR_listen, ALLOW),
++      SYSCALL(__NR_recvfrom, ALLOW),
++      SYSCALL(__NR_recvmsg, ALLOW),
++      SYSCALL(__NR_sendmsg, ALLOW),
++      SYSCALL(__NR_sendto, ALLOW),
++      SYSCALL(__NR_getsockopt, ALLOW),
++      SYSCALL(__NR_getpeername, ALLOW),
++      SYSCALL(__NR_shutdown, ALLOW),
++#ifndef __i386__
++      SYSCALL(__NR_accept, ALLOW),
++#endif
++#ifdef __i386__
++      SYSCALL(__NR_socketcall, ALLOW),
++#endif
++#if defined(__arm__) || defined(__powerpc__)
++      SYSCALL(__NR_send, ALLOW),
++      SYSCALL(__NR_recv, ALLOW),
++#endif
++
++      SYSCALL(__NR_socket, JUMP(&l, socket_l)),
++      SYSCALL(__NR_setsockopt, JUMP(&l, setsockopt_l)),
++      /* File descriptors operations */
++      SYSCALL(__NR_close, ALLOW),
++      SYSCALL(__NR_dup, ALLOW),
++      SYSCALL(__NR_fstat, ALLOW),
++      SYSCALL(__NR_lseek, ALLOW),
++      SYSCALL(__NR_openat, ALLOW),
++      SYSCALL(__NR_read, ALLOW),
++      SYSCALL(__NR_write, ALLOW),
++      SYSCALL(__NR_writev, ALLOW),
++      SYSCALL(__NR_fchown, ALLOW),
++      SYSCALL(__NR_ftruncate, ALLOW),
++      SYSCALL(__NR_fsync, ALLOW),
++#ifndef __aarch64__
++      SYSCALL(__NR_pipe, ALLOW),
++      SYSCALL(__NR_dup2, ALLOW),
++      SYSCALL(__NR_poll, ALLOW),
++#else
++      SYSCALL(__NR_readlinkat, ALLOW),
++      SYSCALL(__NR_newfstatat, ALLOW),
++      SYSCALL(__NR_pipe2, ALLOW),
++      SYSCALL(__NR_unlinkat, ALLOW),
++      SYSCALL(__NR_dup3, ALLOW),
++      SYSCALL(__NR_ppoll, ALLOW),
++#endif
++#if defined(__i386__) || defined(__arm__) || defined(__powerpc__)
++      SYSCALL(__NR_fstat64, ALLOW),
++      SYSCALL(__NR__llseek, ALLOW),
++      SYSCALL(__NR_ftruncate64, ALLOW),
++      SYSCALL(__NR_fcntl64, JUMP(&l, fcntl64_l)),
++#endif
++#if defined(__i386__) || defined(__arm__)
++      SYSCALL(__NR_fchown32, ALLOW),
++#endif
++      SYSCALL(__NR_fcntl, JUMP(&l, fcntl_l)),
++      /* Filesystem operations */
++      SYSCALL(__NR_chdir, ALLOW),
++      SYSCALL(__NR_umask, ALLOW),
++      SYSCALL(__NR_execve, ALLOW),
++      SYSCALL(__NR_inotify_init1, ALLOW),
++      SYSCALL(__NR_inotify_add_watch, ALLOW),
++#ifndef __aarch64__
++      SYSCALL(__NR_access, ALLOW),
++      SYSCALL(__NR_readlink, ALLOW),
++      SYSCALL(__NR_open, ALLOW),
++      SYSCALL(__NR_stat, ALLOW),
++      SYSCALL(__NR_unlink, ALLOW),
++#endif
++#if defined(__i386__) || defined(__arm__) || defined(__powerpc__)
++      SYSCALL(__NR_stat64, ALLOW),
++#endif
++      /* Memory operations */
++      SYSCALL(__NR_brk, ALLOW),
++      SYSCALL(__NR_munmap, ALLOW),
++
++      SYSCALL(__NR_mprotect, JUMP(&l, mprotect_l)),
++#ifndef __arm__
++      SYSCALL(__NR_mmap, JUMP(&l, mmap_l)),
++#endif
++#if defined(__i386__) || defined(__arm__) || defined(__powerpc__)
++      SYSCALL(__NR_mmap2, JUMP(&l, mmap2_l)),
++#endif
++      /* signals/sleep */
++      SYSCALL(__NR_rt_sigaction, ALLOW),
++      SYSCALL(__NR_rt_sigreturn, ALLOW),
++      SYSCALL(__NR_restart_syscall, ALLOW),
++      SYSCALL(__NR_nanosleep, ALLOW),
++#if defined(__x86_64__) || defined(__i386__) || defined(__powerpc__)
++      SYSCALL(__NR_alarm, ALLOW),
++#endif
++#if defined(__i386__) || defined(__arm__) || defined(__powerpc__)
++      SYSCALL(__NR_sigreturn, ALLOW),
++#endif
++      /* user and capabilities */
++      SYSCALL(__NR_capget, ALLOW),
++      SYSCALL(__NR_capset, ALLOW),
++      SYSCALL(__NR_geteuid, ALLOW),
++      SYSCALL(__NR_getuid, ALLOW),
++      SYSCALL(__NR_getpid, ALLOW),
++      SYSCALL(__NR_setgid, ALLOW),
++      SYSCALL(__NR_setgroups, ALLOW),
++      SYSCALL(__NR_setsid, ALLOW),
++      SYSCALL(__NR_setuid, ALLOW),
++#if defined(__i386__) || defined(__arm__)
++      SYSCALL(__NR_getuid32, ALLOW),
++      SYSCALL(__NR_setgroups32, ALLOW),
++      SYSCALL(__NR_setgid32, ALLOW),
++      SYSCALL(__NR_setuid32, ALLOW),
++      SYSCALL(__NR_geteuid32, ALLOW),
++#endif
++      /* Other syscalls */
++      SYSCALL(__NR_exit_group, ALLOW),
++      SYSCALL(__NR_wait4, ALLOW),
++      SYSCALL(__NR_tgkill, ALLOW),
++      SYSCALL(__NR_tkill, ALLOW),
++#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
++      SYSCALL(__NR_getrlimit, ALLOW),
++#endif
++#if defined(__x86_64__) || defined(__i386__) || defined(__powerpc__)
++      SYSCALL(__NR_time, ALLOW),
++#endif
++#if defined(__arm__) || defined(__aarch64__)
++      SYSCALL(__NR_setitimer, ALLOW),
++#endif
++#if defined(__i386__) || defined(__powerpc__)
++      SYSCALL(__NR_waitpid, ALLOW),
++#endif
++
++      SYSCALL(__NR_ioctl, JUMP(&l, ioctl_l)),
++#ifdef __x86_64__
++      SYSCALL(__NR_arch_prctl, JUMP(&l, arch_prctl_l)),
++#endif
++      SYSCALL(__NR_prctl, JUMP(&l, prctl_l)),
++      SYSCALL(__NR_clone, JUMP(&l, clone_l)),
++
++      ret_error_instruction,
++      /* Label processing starts here */
++#ifndef __arm__
++      LABEL(&l, mmap_l),
++      ARG(2),
++      JEQ(PROT_READ|PROT_WRITE, JUMP(&l, mmap_l_2)),
++      JEQ(PROT_READ|PROT_EXEC, JUMP(&l, mmap_l_2)),
++      JEQ(PROT_READ, JUMP(&l, mmap_l_2)),
++      ret_error_instruction,
++      LABEL(&l, mmap_l_2),
++      ARG(3),
++      JEQ(MAP_PRIVATE|MAP_ANONYMOUS, ALLOW),
++      JEQ(MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, ALLOW),
++      JEQ(MAP_PRIVATE|MAP_DENYWRITE, ALLOW),
++      JEQ(MAP_PRIVATE, ALLOW),
++      JEQ(MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, ALLOW),
++      JEQ(MAP_SHARED, ALLOW),
++      ret_error_instruction,
++#endif
++
++#if defined(__i386__) || defined(__arm__) || defined(__powerpc__)
++      LABEL(&l, mmap2_l),
++      ARG(2),
++      JEQ(PROT_READ|PROT_WRITE, JUMP(&l, mmap2_l_2)),
++      JEQ(PROT_READ|PROT_EXEC, JUMP(&l, mmap2_l_2)),
++      JEQ(PROT_READ, JUMP(&l, mmap2_l_2)),
++      ret_error_instruction,
++      LABEL(&l, mmap2_l_2),
++      ARG(3),
++      JEQ(MAP_PRIVATE|MAP_ANONYMOUS, ALLOW),
++      JEQ(MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, ALLOW),
++      JEQ(MAP_PRIVATE|MAP_DENYWRITE, ALLOW),
++      JEQ(MAP_PRIVATE, ALLOW),
++      JEQ(MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, ALLOW),
++      JEQ(MAP_SHARED, ALLOW),
++      ret_error_instruction,
++#endif
++
++      LABEL(&l, mprotect_l),
++      ARG(2),
++      ALLOW,
++      JEQ(PROT_READ, ALLOW),
++      JEQ(PROT_NONE, ALLOW),
++      JEQ(PROT_READ|PROT_WRITE, ALLOW),
++      ret_error_instruction,
++
++      LABEL(&l, socket_l),
++      ARG(0),
++      JEQ(PF_INET, JUMP(&l, socket_l_2)),
++      JEQ(PF_LOCAL, JUMP(&l, socket_l_2)),
++      JEQ(PF_INET6, JUMP(&l, socket_l_2)),
++      JEQ(PF_NETLINK, JUMP(&l, socket_l_2)),
++      ret_error_instruction,
++      LABEL(&l, socket_l_2),
++      ARG(1),
++      JEQ(SOCK_DGRAM, JUMP(&l, socket_l_3)),
++      JEQ(SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, JUMP(&l, socket_l_3)),
++      JEQ(SOCK_STREAM, JUMP(&l, socket_l_3)),
++      JEQ(SOCK_RAW, JUMP(&l, socket_l_3)),
++      JEQ(SOCK_DGRAM|SOCK_CLOEXEC, JUMP(&l, socket_l_3)),
++      ret_error_instruction,
++      LABEL(&l, socket_l_3),
++      ARG(2),
++      JEQ(0, ALLOW), /* Allowing default protocol */
++      JEQ(IPPROTO_UDP, ALLOW),
++      JEQ(IPPROTO_ICMP, ALLOW),
++      JEQ(IPPROTO_ICMPV6, ALLOW),
++      JEQ(NETLINK_ROUTE, ALLOW),
++      ret_error_instruction,
++
++      LABEL(&l, ioctl_l),
++      ARG(1),
++      JEQ(SIOCGIFNAME, ALLOW),
++      JEQ(SIOCGIFMTU, ALLOW),
++      JEQ(SIOCGIFFLAGS, ALLOW),
++      JEQ(SIOCGIFADDR, ALLOW),
++      JEQ(SIOCGSTAMP, ALLOW),
++      JEQ(SIOCSARP, ALLOW),
++#ifndef __powerpc__
++      JEQ(TCGETS, ALLOW),
++#endif
++      ret_error_instruction,
++
++      LABEL(&l, setsockopt_l),
++      ARG(1),
++      JEQ(SOL_SOCKET, JUMP(&l, setsockopt_sol_socket_l)),
++      JEQ(SOL_IP, JUMP(&l, setsockopt_sol_ip_l)),
++      JEQ(SOL_IPV6, JUMP(&l, setsockopt_sol_ipv6_l)),
++      JEQ(SOL_ICMPV6, JUMP(&l, setsockopt_sol_icmpv6_l)),
++      ret_error_instruction,
++      LABEL(&l, setsockopt_sol_socket_l),
++      ARG(2),
++      JEQ(SO_REUSEADDR, ALLOW),
++      JEQ(SO_BROADCAST, ALLOW),
++      JEQ(SO_DONTROUTE, ALLOW),
++      ret_error_instruction,
++      LABEL(&l, setsockopt_sol_ip_l),
++      ARG(2),
++      JEQ(IP_PKTINFO, ALLOW),
++      JEQ(IP_MTU_DISCOVER, ALLOW),
++      JEQ(IP_TOS, ALLOW),
++      ret_error_instruction,
++      LABEL(&l, setsockopt_sol_ipv6_l),
++      ARG(2),
++      JEQ(IPV6_V6ONLY, ALLOW),
++      JEQ(IPV6_RECVPKTINFO, ALLOW),
++      JEQ(IPV6_TCLASS, ALLOW),
++      JEQ(IPV6_RECVPKTINFO, ALLOW),
++      JEQ(IPV6_UNICAST_HOPS, ALLOW),
++      JEQ(IPV6_MULTICAST_HOPS, ALLOW),
++      JEQ(IPV6_ADD_MEMBERSHIP, ALLOW),
++      ret_error_instruction,
++      LABEL(&l, setsockopt_sol_icmpv6_l),
++      ARG(2),
++      JEQ(ICMP6_FILTER, ALLOW),
++      ret_error_instruction,
++
++      LABEL(&l, fcntl_l),
++      ARG(1),
++      JEQ(F_SETFL, JUMP(&l, fcntl_l_2)),
++      JEQ(F_GETFL, ALLOW),
++      ret_error_instruction,
++      LABEL(&l, fcntl_l_2),
++      ARG(2),
++      JEQ(O_RDWR|O_NONBLOCK, ALLOW),
++      JEQ(O_RDWR, ALLOW),
++      JEQ(O_WRONLY|O_NONBLOCK, ALLOW),
++      JEQ(O_RDONLY|O_NONBLOCK, ALLOW),
++      ret_error_instruction,
++
++#if defined(__i386__) || defined(__arm__) || defined(__powerpc__)
++      LABEL(&l, fcntl64_l),
++      ARG(1),
++      JEQ(F_SETFL, JUMP(&l, fcntl64_l_2)),
++      JEQ(F_GETFL, ALLOW),
++      ret_error_instruction,
++      LABEL(&l, fcntl64_l_2),
++      ARG(2),
++      JEQ(O_RDWR|O_NONBLOCK, ALLOW),
++      JEQ(O_RDWR, ALLOW),
++      JEQ(O_WRONLY|O_NONBLOCK, ALLOW),
++      JEQ(O_RDONLY|O_NONBLOCK, ALLOW),
++      ret_error_instruction,
++#endif
++
++#ifdef __x86_64__
++      LABEL(&l, arch_prctl_l),
++      ARG(0),
++      JEQ(ARCH_SET_FS, ALLOW),
++      ret_error_instruction,
++#endif
++
++      LABEL(&l, prctl_l),
++      ARG(0),
++      JEQ(PR_SET_KEEPCAPS, ALLOW),
++      ret_error_instruction,
++
++      LABEL(&l, clone_l),
++      ARG(0),
++      JEQ(CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD,
++          ALLOW),
++      ret_error_instruction,
++    };
++    if (bpf_resolve_jumps(&l, filter, (sizeof(filter) / sizeof(filter[0]))))
++    {
++      return 1;
++    }
++    struct sock_fprog prog = {
++      .len = (unsigned short) (sizeof(filter) / sizeof(filter[0])),
++      .filter = filter,
++    };
++    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
++                SECCOMP_FILTER_FLAG_TSYNC, &prog))
++    {
++      return 1;
++    }
++#endif /* __NR_seccomp */
++    return 0;
++}
++
++#endif /* HAVE_SECCOMP */
++
