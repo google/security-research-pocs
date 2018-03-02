@@ -1,5 +1,6 @@
+#include <stdint.h>
 #include <string>
-#include "lcms/include/lcms2.h"
+#include "lcms2.h"
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size < 2) {
