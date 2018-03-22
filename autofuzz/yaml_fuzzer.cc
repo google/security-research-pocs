@@ -2638,11 +2638,13 @@ emitter_main(void)
 
             done = (event.type == YAML_STREAM_END_EVENT);
             if(!(event_number < MAX_EVENTS)) {
+              yaml_event_delete(&event);
               error = 1;
               break;
             }
 
             if(!(copy_event(&(events[event_number++]), &event))) {
+              yaml_event_delete(&event);
               error = 1;
               break;
             }
