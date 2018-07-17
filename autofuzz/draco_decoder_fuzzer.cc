@@ -1,7 +1,7 @@
-#include "draco/compression/decode.h"
-#include "draco/core/decoder_buffer.h"
-#include "draco/mesh/mesh.h"
-#include "draco/point_cloud/point_cloud.h"
+#include "draco/src/draco/compression/decode.h"
+#include "draco/src/draco/core/decoder_buffer.h"
+#include "draco/src/draco/mesh/mesh.h"
+#include "draco/src/draco/point_cloud/point_cloud.h"
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   draco::DecoderBuffer buffer;
