@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include "leptonica/include/allheaders.h"
+#include "allheaders.h"
 
 namespace {
 
