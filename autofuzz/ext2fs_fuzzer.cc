@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
-#include "lib/ext2fs/ext2fs.h"
+#include "ext2fs/ext2fs.h"
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static const char* pattern = "/dev/shm/ext2XXXXXX";
