@@ -16,6 +16,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // Do nothing.
   } catch (const nlohmann::detail::type_error&) {
     // Do more of nothing.
+  } catch (const nlohmann::detail::out_of_range&) {
+    // Do more of nothing.
   }
 
   return 0;
