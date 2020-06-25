@@ -13,14 +13,15 @@ using std::make_pair;
 #include "uriparser/include/uriparser/Uri.h"
 #include "uriparser/include/uriparser/UriBase.h"
 
-std::vector<std::pair<string, string>> ToVector(UriQueryListA *query_list) {
-  std::vector<std::pair<string, string>> result;
+std::vector<std::pair<std::string, std::string>> ToVector(
+    UriQueryListA *query_list) {
+  std::vector<std::pair<std::string, std::string>> result;
   if (query_list == nullptr) return result;
   for (UriQueryListA *entry = query_list; entry != nullptr;
        entry = entry->next) {
     // The value can be a nullptr.
-    result.push_back(
-        make_pair(entry->key, entry->value == nullptr ? "null" : entry->value));
+    result.push_back(std::make_pair(
+        entry->key, entry->value == nullptr ? "null" : entry->value));
   }
   uriFreeQueryListA(query_list);
   return result;

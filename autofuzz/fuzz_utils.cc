@@ -1,11 +1,11 @@
+#include "fuzz_utils.h"
+
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#include "fuzz_utils.h"
 
 extern "C" int ignore_stdout(void) {
   int fd = open("/dev/null", O_WRONLY);

@@ -7,4 +7,5 @@ package third_party.uriparser.fuzzers;
 message UriParserData {
   required bytes uri1 = 1;
   required bytes uri2 = 2;
+  required bool domainrelative = 3;
 }

@@ -24,18 +24,18 @@ class UriParserA {
 };
 
 void Escapes(const std::string &uri) {
-    const char *first = uri.c_str();
-    // A new line char takes 6 char to encode.
-    // Use a vector to make a C string.
-    std::vector<char> buf(uri.size() * 6 + 1);
+  const char *first = uri.c_str();
+  // A new line char takes 6 char to encode.
+  // Use a vector to make a C string.
+  std::vector<char> buf(uri.size() * 6 + 1);
 
-    char* result = uriEscapeA(first, &buf[0], URI_TRUE, URI_TRUE);
-    
+  char *result = uriEscapeA(first, &buf[0], URI_TRUE, URI_TRUE);
+  
 
-    result = uriEscapeA(first, &buf[0], URI_FALSE, URI_FALSE);
-    
+  result = uriEscapeA(first, &buf[0], URI_FALSE, URI_FALSE);
+  
 
-    
+  
 }
 
 void FileNames(const std::string &uri) {
@@ -105,6 +105,14 @@ DEFINE_PROTO_FUZZER(const UriParserData &data_proto) {
 
   uriNormalizeSyntaxA(state1.uri);
 
-  
+  UriUriA absUri;
+  uriAddBaseUriA(&absUri, state1.uri, state2.uri);
+  uriFreeUriMembersA(&absUri);
+
+  UriUriA relUri;
+  uriRemoveBaseUriA(&relUri, state1.uri, state2.uri,
+                    data_proto.domainrelative());
+  uriFreeUriMembersA(&relUri);
+
   
 }
