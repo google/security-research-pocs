@@ -9,7 +9,7 @@ and discuss design decisions.
 
 As you've seen, the demo is timing the difference between L1 and L2 cache hits
 instead of comparing L3 vs memory accesses. For details how the timer works,
-please read https://leaky.page.com/plru.html.
+please read https://leaky.page/plru.html.
 
 While experimenting, the first version of the poc was using an L3 timer. This
 has a few advantages:
