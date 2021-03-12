@@ -1,0 +1,293 @@
+{#
+Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+{% extends 'base.html' %}
+
+{% block script %}
+
+<script>
+function sortArray(arr) {
+  for (let i = 0; i < arr.length; i++) {
+    for (let j = 0; j < arr.length-1; j++) {
+      if (arr[j] > arr[j+1]) {
+        const tmp = arr[j];
+        arr[j] = arr[j+1];
+        arr[j+1] = tmp;
+      }
+    }
+  }
+  return arr;
+}
+
+// Function to compute density
+function kernelDensityEstimator(kernel, X) {
+  return function(V) {
+    return X.map(function(x) {
+      return [x, d3.mean(V, function(v) { return kernel(x - v); })];
+    });
+  };
+}
+function kernelEpanechnikov(k) {
+  return function(v) {
+    return Math.abs(v /= k) <= 1 ? 0.75 * (1 - v * v) / k : 0;
+  };
+}
+
+let cacheHits = [];
+let cacheMisses = [];
+
+let xScale = undefined;
+
+function plotDensity() {
+  d3.select("svg").remove();
+
+  const maxValue = Math.max(...cacheHits, ...cacheMisses);
+
+  const div = document.getElementById('timing_graph');
+  const size = Math.min(div.clientWidth, div.clientHeight);
+
+  // set the dimensions and margins of the graph
+  var margin = {top: 30, right: 30, bottom: 30, left: 50},
+      width = size - margin.left - margin.right,
+      height = size - margin.top - margin.bottom;
+
+  // append the svg object to the body of the page
+  var svg = d3.select("#timing_graph")
+    .append("svg")
+      .attr("width", width + margin.left + margin.right)
+      .attr("height", height + margin.top + margin.bottom)
+    .append("g")
+      .attr("transform",
+            "translate(" + margin.left + "," + margin.top + ")");
+
+  var x = d3.scaleLinear()
+            .domain([0, maxValue*1.2])
+            .range([0, width]);
+  xScale = x;
+
+  //var kde = kernelDensityEstimator(kernelEpanechnikov(0.05), x.ticks(500))
+  var kde = kernelDensityEstimator(kernelEpanechnikov(maxValue/20), x.ticks(500))
+
+  var hitsDensity = kde(cacheHits);
+  var missesDensity = kde(cacheMisses);
+  maxY = Math.max(...hitsDensity.map(v=>v[1]), ...missesDensity.map(v=>v[1]));
+
+  svg.append("g")
+      .attr("transform", "translate(0," + height + ")")
+      .call(d3.axisBottom(x));
+
+  // add the y Axis
+  var y = d3.scaleLinear()
+            .range([height, 0])
+            .domain([0, maxY]);
+  svg.append("g")
+      .call(d3.axisLeft(y).tickValues([]));
+
+  // Plot the area
+  svg.append("path")
+    .attr("class", "mypath")
+    .datum(hitsDensity)
+    .attr("fill", "#69b3a2")
+    .attr("opacity", ".8")
+    .attr("stroke", "#000")
+    .attr("stroke-width", 1)
+    .attr("stroke-linejoin", "round")
+    .attr("d",  d3.line()
+      .curve(d3.curveBasis)
+      .x(function(d) { return x(d[0]); })
+      .y(function(d) { return y(d[1]); })
+    );
+
+  svg.append("path")
+    .attr("class", "mypath")
+    .datum(missesDensity)
+    .attr("fill", "#404080")
+    .attr("opacity", ".6")
+    .attr("stroke", "#000")
+    .attr("stroke-width", 1)
+    .attr("stroke-linejoin", "round")
+    .attr("d",  d3.line()
+      .curve(d3.curveBasis)
+      .x(function(d) { return x(d[0]); })
+      .y(function(d) { return y(d[1]); })
+    );
+
+  if (cacheHits.length != 0) {
+    const hitsMedian = cacheHits[Math.floor(cacheHits.length/2)];
+    const missMedian = cacheMisses[Math.floor(cacheMisses.length/2)];
+    if (hitsMedian > missMedian) {
+      const threshold = missMedian + ((hitsMedian - missMedian)/2);
+      setParameter('cache_threshold', threshold);
+
+      const thresholdLine = svg.append('line')
+        .attr("x1", x(threshold))
+        .attr("y1", 0)
+        .attr("x2", x(threshold))
+        .attr("y2", height)
+        .style("stroke-width", 2)
+        .style("stroke", "red")
+        .style("cursor", "pointer")
+        .style("fill", "none");
+
+      d3.drag()
+      .on("drag", dragThreshold)(thresholdLine);
+    }
+  }
+}
+
+function dragThreshold() {
+  setParameter('cache_threshold', xScale.invert(d3.event.x));
+  d3.select(this).attr("x1", d3.event.x).attr("x2", d3.event.x);
+}
+
+window.onmessage = function(event) {
+  cacheHits = event.data.hits;
+  cacheMisses = event.data.misses;
+  sortArray(cacheHits);
+  sortArray(cacheMisses);
+  cacheHits = cacheHits.slice(0, Math.floor(cacheHits.length*0.98));
+  cacheMisses = cacheMisses.slice(0, Math.floor(cacheMisses.length*0.98));
+  plotDensity();
+}
+
+function delete_iframe() {
+  const iframe = document.getElementById('timer_frame');
+  if (!iframe) return;
+  iframe.remove();
+}
+
+function run() {
+  delete_iframe();
+  const iframe = document.createElement('iframe');
+
+  const params = {
+    l1_reps: document.getElementById('reps').value,
+    test_reps: 200,
+    stable_timer: document.getElementById('stable_timer').checked,
+    {% if macos %}
+      m1_cpu: document.getElementById('m1_cpu').checked,
+    {% endif %}
+  };
+
+  iframe.src = `{{ frame_origin }}/timer_frame.html?${new URLSearchParams(params)}`;
+  iframe.id = 'timer_frame';
+  iframe.style.display = 'none';
+  document.body.appendChild(iframe);
+}
+
+const graphResizeObserver = new ResizeObserver(plotDensity);
+
+function init() {
+  const prevButton = document.getElementById('prevButton');
+  prevButton.onclick = () => {
+    location = '/';
+  };
+  prevButton.disabled = false;
+
+  const nextButton = document.getElementById('nextButton');
+  nextButton.onclick = () => {
+    location = '/memory.html';
+  };
+  nextButton.disabled = false;
+
+  const menuEnabled = sessionStorage.getItem('menuEnabled');
+  if (menuEnabled === null) {
+    document.getElementById('menu').style.display = '';
+  }
+
+  enableParameters('timer', true);
+
+  graphResizeObserver.observe(document.getElementById('contentSplit'));
+  plotDensity();
+}
+
+</script>
+
+{% endblock %}
+
+{% block content %}
+
+<div id="contentSplit">
+<div id="contentLeft">
+<div class=center>
+<h1> L1 Cache Timer </h1>
+  <p>
+  Before we run the Spectre proof of concept, we need a way to observe the side-effects of the <a href="https://en.wikipedia.org/wiki/Transient_execution_CPU_vulnerability" target="_blank">transient execution</a>.
+  The most popular one is a cache side channel.
+  By timing a memory access, we can infer if a chosen address is in the cache (if the access is fast) or needs to be loaded from memory (if the access is slow).
+  Later, we will use a Spectre gadget to access a JavaScript array using a secret value as the index.
+  Testing which array index got cached will allow us to recover that secret value.
+  </p>
+  <p>
+  To be able to measure these small timing differences we need a high-precision timer. There is a great <a href="https://pure.tugraz.at/ws/portalfiles/portal/17611474/fantastictimers.pdf" target="_blank">paper</a> on this topic by Michael Schwarz, Clémentine Maurice, Daniel Gruss, and Stefan Mangard: <em>"Fantastic Timers and Where to Find Them: High-Resolution Microarchitectural Attacks in JavaScript"</em>.
+  One example they show is the use of a <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer" target="_blank">SharedArrayBuffer</a> as a monotonic clock:
+  increment a counter in a worker thread and read it from a second thread as a high precision timestamp. SharedArrayBuffers in particular are nowadays only available if the site is <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer#security_requirements">cross-origin isolated</a> but there are many more timers described in that paper.
+  </p>
+  <p>
+  An alternative to using a high-precision timer is to amplify the timing difference. By triggering the code repeatedly and measuring the cumulative time, we can increase the time difference and use timers with lower precision.
+  However, this introduces noise and can be difficult if the code to be measured is probabilistic.
+  </p>
+  <p>
+  In this proof of concept, we implemented the latter method with a trick that avoids triggering the code to be measured repeatedly.
+  We're measuring the timing difference between the L1 and L2 cache and are amplifying it by abusing an L1 cache eviction strategy found commonly on modern CPUs.
+  This works as follows:
+  <ol>
+    <li>Fill a chosen cache set in the L1 cache with known entries.</li>
+    <li>Trigger the code that might access the cache set.</li>
+    <li>Repeatedly access the known entries, while keeping the secret entry in the cache.</li>
+  </ol>
+  If the code in step 2 accessed the cache set, one of our known values got evicted and we will repeatedly see L1 misses in step 3. If it didn't access it, all access in step 3 will be fast L1 hits. We then measure this difference using <a href="https://developer.mozilla.org/en-US/docs/Web/API/Performance/now" target="_blank">performance.now()</a>, which at the time of writing has a resolution of 5μs in Chrome on desktop. If you're interested in the technical details of the technique please check out this <a href="plru.html" target="_blank">writeup</a>.
+  </p>
+  <p>
+  For the demo, you can play with the "Cache timer repetitions" option in the menu on the right. It controls the number of iterations of step 3 above. If you increase the value, it will work with even lower precision timers but it will also take longer to run.
+  Some rough example values and resulting timing differences:
+  <table style="text-align: right;">
+    <tr>
+      <td>4000:</td><td>20us</td>
+    </tr>
+    <tr>
+      <td>40000:</td><td>200us</td>
+    </tr>
+    <tr>
+      <td>400000:</td><td>2ms</td>
+    </tr>
+  </table>
+  </p>
+  <p>
+  The demo also serves as the timer calibration for the next examples. It will try to infer a good threshold automatically, but you can adjust it manually if it didn't work. Note that if you change the timer repetitions, you will have to re-run this calibration.
+  </p>
+  <p>
+    Click <i>run</i> to plot the results in the graph on the right. The X axis shows you the timer results.
+  If everything works, there should be two clearly distinct peaks visible in the graph: a purple one on the left and a green one on the right.
+  The measured timings if the cache line was not used by the code that is being tested are shown in purple. They should be faster on average.
+  The green graph shows the timings if the cache line was used, so it leads to more L1 cache misses and becomes slower.
+  </p>
+  <p>
+  If the measurements fail, try modifying the parameters for the cache timer repetitions and the stable timer. Another reason for failure can be high CPU load from other processes on the system.
+  </p>
+  <p>
+  <button onclick="run()" class="runButton">run</button>
+  </p>
+  <h3>Options</h3>
+  <table id="paramTable"></table>
+</div>
+</div>
+<div id="contentRight" class="graphContainer">
+<div id="timing_graph"></div>
+</div>
+</div>
+
+{% endblock %}

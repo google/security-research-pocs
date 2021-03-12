@@ -1,0 +1,209 @@
+* {
+  font-family: 'Crimson Text', serif;
+}
+
+.container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.main {
+    flex-grow: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: row;
+}
+
+.navigation {
+  display: flex;
+  flex-direction: row;
+}
+
+.navigation button{
+  width: 50%;
+  min-height: 50px;
+  font-size: x-large;
+  margin: 0.03em;
+  border-radius: 0.2em;
+}
+
+.content {
+  overflow: auto;
+  margin: 2em;
+  flex-shrink: 1;
+  /* margin-right: auto; */
+  width: 100%;
+  display: flex;
+}
+
+.menu {
+    padding-top: 6em;
+    flex-shrink: 0;
+    padding-left: 0.5em;
+    padding-right: 0.5em;
+    border-left-style: inset;
+}
+
+#menubutton {
+  position: fixed;
+  top: 2.5em;
+  right: 3em;
+}
+
+.menu {
+    /* display: table; */
+}
+.menuitem {
+  display: grid;
+  grid-template-columns: 65% 25% 10%;
+}
+.menu div label {
+  padding-right: 1em;
+}
+.menu div input {
+  text-align: right;
+}
+.menu div input[type="checkbox"] {
+  margin: auto;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  height: 100%;
+  margin: 0;
+}
+
+.graphContainer {
+  display: flex;
+  flex-direction: column;
+}
+
+#timing_graph {
+  margin: auto;
+  width: 100%;
+  height: 100%;
+  display: flex;
+}
+
+#timing_graph svg {
+  margin: auto;
+}
+
+#contentSplit {
+  display: grid;
+  grid-template-columns: 50% auto;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+#contentLeft {
+  overflow: auto;
+}
+
+#contentRight {
+  margin-left: 1em;
+  overflow: auto;
+}
+
+.center {
+  margin: 0 auto;
+  max-width: 50em;
+}
+
+.runButton {
+  margin: 0 auto;
+  display: block;
+  font-weight: bold;
+  width: 5em;
+  height: 2.5em;
+  border-radius: 0.5em;
+}
+
+.termBox {
+  background-color: black;
+  /* width: 100%; */
+  /* overflow: auto; */
+  border-style: ridge;
+  border-color: darkgray;
+  overflow: auto;
+}
+
+#logBox {
+  overflow: auto;
+}
+
+.term {
+  margin: 1em;
+  color: limegreen;
+  font-family: 'Roboto Mono', monospace;
+}
+
+#spectreOut {
+  display: grid;
+  grid-template-rows: 25% auto;
+  height: 100%;
+  overflow: hidden;
+}
+
+#spectreOut #logBox {
+  margin-bottom: 1em;
+}
+
+.js-code {
+  margin-bottom: 1em;
+  padding-top: 0.7em;
+  padding-bottom: 0.7em;
+}
+
+.js-code, .js-code * {
+  white-space: pre;
+  font-family: 'Roboto Mono', monospace;
+  font-size: small;
+  background: #002b36;
+  color: #839496;
+}
+
+.js-keyword {
+  color: #859900;
+}
+
+.js-constant {
+  color: #dc322f;
+}
+
+#jsarray {
+    margin-right: 2em;
+}
+
+.paramLabel {
+  font-weight: bold;
+  width: 25%;
+}
+
+.paramDescription {
+  padding-left: 0.5em;
+  /* border-left: 1px solid black; */
+}
+
+#paramTable {
+    border-collapse: collapse;
+    border: 1px solid black;
+}
+
+#paramTable td {
+    padding: 0.4em;
+    border-bottom: 1px solid black;
+}
+
+#hitGraph, #missGraph {
+    zoom: 90%;
+}
+
+button {
+  cursor: pointer;
+}

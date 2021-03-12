@@ -1,0 +1,261 @@
+{#
+Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+{% extends 'base.html' %}
+
+{% block script %}
+<script>
+
+var cacheData = [];
+var alignedIndex = -1;
+var inferredCacheSet = -1;
+
+function createGraph() {
+  const rowLength = 64;
+  const array_div = document.getElementById('jsarray');
+  const elementWidth = array_div.clientWidth/rowLength;
+
+  var gridSvg = d3.select("#cachegrid")
+    .append("svg")
+      .attr("width", elementWidth * rowLength)
+      .attr("height", elementWidth * rowLength);
+
+  gridSvg.selectAll('g')
+    .data(new Array(rowLength))
+    .enter().append('g')
+      .selectAll('rect')
+      .data(new Array(rowLength))
+      .enter().append('rect')
+        .attr('x', (d, i) => (i%rowLength)*elementWidth)
+        .attr('y', (d, i) => (Math.floor(i/rowLength))*elementWidth)
+        .attr('width', elementWidth)
+        .attr('height', elementWidth)
+        .attr('stroke', 'black')
+        .attr('fill', 'white');
+
+  var arraySvg = d3.select("#jsarray")
+    .append("svg")
+      .attr("width", elementWidth * rowLength)
+      .attr("height", elementWidth);
+
+  arraySvg.selectAll('rect')
+    .data(new Array(rowLength))
+    .enter().append('rect')
+      .attr('x', (d, i) => i*elementWidth)
+      .attr('y', '0')
+      .attr('width', elementWidth)
+      .attr('height', elementWidth)
+      .attr('stroke', 'black')
+      .attr('fill', 'white')
+      .on("mouseover", (_, arrayIndex) => {
+        gridSvg.selectAll('g').each(function(_, rowIndex) {
+          d3.select(this).selectAll('rect')
+            .attr('stroke', () => {
+              return rowIndex == arrayIndex ? 'red' : 'black';
+            })
+            .attr('stroke-width', () => {
+              return rowIndex == arrayIndex ? '1.5' : '1';
+            });
+        });
+      });
+}
+
+function resizeGraph() {
+  const rowLength = 64;
+  const array_div = document.getElementById('jsarray');
+  const elementWidth = array_div.clientWidth/rowLength;
+  d3.select("#jsarray").select('svg')
+    .attr("width", elementWidth * rowLength)
+    .attr("height", elementWidth)
+    .selectAll('rect')
+      .attr('x', (d, i) => i*elementWidth)
+      .attr('y', '0')
+      .attr('width', elementWidth)
+      .attr('height', elementWidth)
+
+  d3.select("#cachegrid").select('svg')
+    .attr("width", elementWidth * rowLength)
+    .attr("height", elementWidth * rowLength)
+    .selectAll('rect')
+      .attr('x', (d, i) => (i%rowLength)*elementWidth)
+      .attr('y', (d, i) => (Math.floor(i/rowLength))*elementWidth)
+      .attr('width', elementWidth)
+      .attr('height', elementWidth);
+}
+
+function correctCacheHit(alignedIndex, d) {
+  if (alignedIndex == -1) return false;
+  const distanceFromAlignedIndex = d.arrayIndex - alignedIndex;
+  const cacheSetDiff = Math.floor(distanceFromAlignedIndex / 16);
+  return ((64 + inferredCacheSet + cacheSetDiff) % 64) == d.cacheSet;
+}
+
+const arrayColors = [
+  'blue',
+  'green',
+  'yellow',
+  'orange',
+  'purple'
+]
+
+function colorForArrayIndex(alignedIndex, index) {
+  if (alignedIndex == -1) return d3.color('red');
+  const distanceFromAlignedIndex = index - alignedIndex;
+  const colorIndex = (arrayColors.length + Math.floor(distanceFromAlignedIndex / 16)) % arrayColors.length;
+  return d3.color(arrayColors[colorIndex]);
+}
+
+function plotCacheHits() {
+  const elementsPerCacheLine = 64 / 4;
+  const rowLength = 64;
+  const padElements = 16;
+  const sliceAlignedIndex = alignedIndex < padElements ? alignedIndex : padElements;
+  d3.select('#jsarray').selectAll('rect')
+    .attr('fill', (d, i) => {
+      return colorForArrayIndex(sliceAlignedIndex, i);
+    });
+
+  const elementStart = alignedIndex > padElements ? alignedIndex - padElements : 0;
+  const numElements = 64;
+  const elementEnd = elementStart+numElements;
+  const numCacheSets = 64;
+  const cacheSetStart = inferredCacheSet == -1 ? 0 : inferredCacheSet - (inferredCacheSet % 64);
+  const cacheSetEnd = cacheSetStart + 64;
+  const dataSlice = cacheData.slice(elementStart, elementEnd).map(arr => arr.slice(cacheSetStart, cacheSetEnd));
+  const gridData = [];
+  for (let i = 0; i < dataSlice.length; i++) {
+    const cacheSets = dataSlice[i];
+    for (let j = 0; j < cacheSets.length; j++) {
+      gridData.push({arrayIndex: i, cacheSet: j, cacheHits: cacheSets[j]});
+    }
+  }
+  const cacheGrid = d3.select("#cachegrid").selectAll('rect').data(gridData);
+  cacheGrid.transition()
+    .attr('fill', (d, i) => {
+      const color = correctCacheHit(sliceAlignedIndex, d) ? colorForArrayIndex(sliceAlignedIndex, d.arrayIndex) : d3.color('darkgrey');
+      color.opacity = d.cacheHits / document.getElementById('measurement_reps').value;
+      return color;
+    });
+
+  cacheGrid.exit()
+    .attr('fill', 'black');
+}
+
+window.onmessage = function(event) {
+  const result = document.createElement('div');
+  result.innerText = `success: ${event.data.success}, aligned index: ${event.data.alignedIndex}, inferred cache set: ${event.data.inferredCacheSet}`;
+  cacheData = event.data.cacheHits;
+  alignedIndex = event.data.alignedIndex;
+  inferredCacheSet = event.data.inferredCacheSet;
+  document.getElementById('status').innerText = event.data.success ? 'success' : 'failed';
+  plotCacheHits();
+}
+
+function run() {
+  document.getElementById('status').innerText = 'running';
+  const iframe = document.createElement('iframe');
+
+  const params = {
+    l1_reps: document.getElementById('reps').value,
+    cache_threshold: document.getElementById('cache_threshold').value,
+    measurements: document.getElementById('measurements').value,
+    measurement_reps: document.getElementById('measurement_reps').value,
+    stable_timer: document.getElementById('stable_timer').checked,
+    {% if macos %}
+      m1_cpu: document.getElementById('m1_cpu').checked,
+    {% endif %}
+  };
+
+  iframe.src = `{{ frame_origin }}/memory_frame.html?${new URLSearchParams(params)}`;
+  iframe.id = 'memory_frame';
+  iframe.hidden = true;
+  document.body.appendChild(iframe);
+
+}
+
+const graphResizeObserver = new ResizeObserver(resizeGraph);
+function init() {
+  const prevButton = document.getElementById('prevButton');
+  prevButton.onclick = () => {
+    location = '/timer.html';
+  };
+  prevButton.disabled = false;
+
+  const nextButton = document.getElementById('nextButton');
+  nextButton.onclick = () => {
+    location = '/spectre.html';
+  };
+  nextButton.disabled = false;
+
+  const menuEnabled = sessionStorage.getItem('menuEnabled');
+  if (menuEnabled === null) {
+    document.getElementById('menu').style.display = '';
+  }
+
+  enableParameters('timer', false);
+  enableParameters('memory', true);
+
+  createGraph();
+
+  graphResizeObserver.observe(document.getElementById('contentSplit'));
+}
+
+</script>
+
+{% endblock %}
+
+{% block content %}
+
+<div id="contentSplit">
+<div id="contentLeft">
+<div class=center>
+<h1>Memory Layout Inference</h1>
+
+<p>
+Now that we are able to test if the code accessed a certain cache set, we can use it to infer the memory layout of JavaScript objects.
+If we access a JavaScript array at different offsets, we can infer which offset corresponds to which cache set.
+Since the L1 cache set is usually chosen based on bits 6 to 11 of the address, this directly translates into the page offset of the array element.
+The lowest 6 bits can be inferred by searching for the cache set boundary.
+For example, if array index 19 is in cache set 5 and index 20 is in cache set 6, we know that index 20 is the start of the cache set.
+</p>
+<p>
+For this demo, you can control how many indices should be tested and how often every test should be repeated.
+The code will then try to find the pattern described to find the cache set boundary.
+</p>
+<p>
+If the demo is successful, you should see a hit on a cache line that moves forward after exactly 16 index increments. The number 16 comes from the size of a cache line (64 bytes) divided by the size of the elements (4 bytes).
+You should also see a few cache sets that always show hits as they are probably used by the code, and a bunch of noise. But the incrementing pattern should still stand out and be easily recognizable.
+</p>
+<p>
+Note that this code is just a demo to show the technique and can't be used for calibration of the Spectre demo since the memory layout will change on every run and needs to be recomputed.
+</p>
+<p>
+<button onclick="run()" class="runButton">run</button>
+</p>
+<h3>Options</h3>
+<table id="paramTable"></table>
+</div>
+</div>
+<div id="contentRight">
+<h1>Status: <span id="status">not started</span></h1>
+JavaScript Array:
+<div id="jsarray"></div>
+Cache hits:
+<div id="cachegrid"></div>
+</div>
+</div>
+
+{% endblock %}

@@ -1,0 +1,615 @@
+{#
+Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+<!doctype html>
+<html>
+
+<head>
+  <title>Spectre</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://d3js.org/d3.v4.js"></script>
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=Crimson+Text&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500&display=swap" rel="stylesheet">
+</head>
+
+<body>
+  <div class="container">
+    <div class="main">
+      <div class="content">
+        <div id="contentSplit">
+          <div id="contentLeft">
+            <div class=center>
+              <h1>Tree-PLRU based L1 Eviction Timer</h1>
+              <p>
+              When the CPU loads a value into the L1 cache, it usually needs to choose an existing entry to evict first. There are different eviction strategies to do this, but most modern desktop CPUs use a tree based "Pseudo Least Recently Used" algorithm, <a href="https://en.wikipedia.org/wiki/Pseudo-LRU#Tree-PLRU" target="_blank">Tree-PLRU</a> in short.
+                A given cache set is organized in a tree structure and every node stores which side of the tree has been accessed farther in the past (least recently used). Choosing a good candidate for eviction is then as simple as following the arrows in the tree.
+              </p>
+              <p>
+              This also means that in the worst case, an element that has been accessed once can stay in the cache forever. This happens if the neighbor in the tree gets accessed everytime the element is about to be evicted. We can use this to test for an L1 access using low precision timers as follows:
+              <ol>
+                <li>Fill the cache set with known values</li>
+                <li>Trigger the code to test, which might or might not access the cache set</li>
+                <li>Repeatedly access the known values from step 1, but keep the unknown element in the cache by accessing its neighbor when needed</li>
+              </ol>
+              The repeated accesses in step 3 will either trigger an L1 cache hit or a cache miss, depending on the outcome of step 2. As an example for the speed difference, a load from L1 takes 4 cycles on my machine, while an L2 load takes 12 cycles.
+              </p>
+              <p>
+              Check out the animation on the right and compare what happens when there's a cache hit from the instrumented code, i.e. the unknown element in red marked with an <em>X</em>.
+              The element to keep it alive is marked with a <em>K</em>.
+              You will see that they always end up as neighbors even though the initial state of the cache is randomized.
+              Note how everytime the arrows point to <em>X</em>, we access <em>K</em> instead to keep it in the cache.
+              </p>
+              <p>
+              Repeating this access pattern allows us to increase the time difference until we can measure it with our low precision timer.
+              </p>
+              <label for="simplified">Simplified tree: </label><input id="simplified" type="checkbox" checked onchange="reset()"/></br>
+              <label for="speed">Speed: </label><input id="speed" type="range" min="1" max="50" value="10" /></br>
+              </br>
+              <button id="resetButton" onclick="reset()">reset</button>
+              <button id="stepButton" onclick="step()">step</button>
+              <button id="playButton" onclick="play()">play</button>
+            </div>
+          </div>
+          <div id="contentRight" class="graphContainer">
+            <div id="hitGraph">
+              <h2>Cache access in instrumented code</h2>
+              <div id="hitPipeline"></div>
+              <div id="hitTree"></div>
+            </div>
+            <div id="missGraph">
+              <h2>No cache access in instrumented code</h2>
+              <div id="missPipeline"></div>
+              <div id="missTree"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+
+<script>
+
+function calcNodeX(node, svgWidth) {
+  const columns = Math.pow(2, node.row);
+  const horizontalDistance = svgWidth / (columns+1);
+  return horizontalDistance * (node.column+1);
+}
+
+function calcNodeY(node, svgHeight, rows) {
+  const verticalDistance = svgHeight / (rows+1);
+  return verticalDistance * (node.row+1);
+}
+
+function generateRandomArrows(rows) {
+  const arrows = [];
+  for (let row = 0; row < rows-1; row++) {
+    const columns = Math.pow(2, row);
+    for (let column = 0; column < columns; column++) {
+      arrows.push({
+        from: {row: row, column: column},
+        to: {row: row+1, column: 2*column + Math.floor(2*Math.random())},
+        stroke: 'black',
+        marker: 'arrow'
+      });
+    }
+  }
+  return arrows;
+}
+
+let cacheWays = 8;
+let keepAlive = cacheWays/2;
+let width = 800;
+let height = 400;
+let nodeWidth = (width / cacheWays) * 0.4;
+let rows = Math.log2(cacheWays)+1;
+
+let graphData = {
+  'hit': {
+    pattern: [],
+    nodes: [],
+    arrows: [],
+  },
+  'miss': {
+    pattern: [],
+    nodes: [],
+    arrows: [],
+  }
+}
+
+function calcArrowCoordinates(d) {
+  const fromX = calcNodeX(d.from, width);
+  const fromY = calcNodeY(d.from, height, rows);
+  const toX = calcNodeX(d.to, width);
+  const toY = calcNodeY(d.to, height, rows);
+  const diffX = toX - fromX;
+  const diffY = toY - fromY;
+  const angle = Math.atan2(diffY, diffX);
+  return {
+    x1: fromX + nodeWidth/2*Math.cos(angle),
+    y1: fromY + nodeWidth/2*Math.sin(angle),
+    x2: toX - nodeWidth/2*Math.cos(angle),
+    y2: toY - nodeWidth/2*Math.sin(angle),
+  };
+}
+
+function generateMemoryAccessPattern(pattern, cacheHit) {
+  pattern.length = 0;
+  for (let i = 0; i < cacheWays; i++) {
+    pattern.push(i);
+  }
+  if (cacheHit) {
+    pattern.push('X');
+  } else {
+    pattern.push(-1);
+  }
+  for (let cnt = 0; cnt < 30; cnt++) {
+    if (cnt > 0 && cnt % (keepAlive-1) == 0) pattern.push(keepAlive);
+    const index = cnt % (cacheWays-1);
+    pattern.push(index < keepAlive ? index : index+1);
+  }
+}
+
+function color(value) {
+  let colorName = '';
+  let opacity = 1;
+  switch (value) {
+    case -1:
+      colorName = 'darkgray';
+      break;
+    case 'X':
+      colorName = 'red';
+      opacity = 0.8;
+      break;
+    case keepAlive:
+      colorName = 'green';
+      opacity = 0.8;
+      break;
+    default:
+      colorName = [
+        'orange',
+        'blue',
+        'yellow',
+        'purple',
+        'brown',
+        'lightblue',
+        'lightgreen'
+      ][value < keepAlive ? value : value - 1];
+      opacity = 0.7;
+      break;
+  }
+  const color = d3.color(colorName);
+  color.opacity = opacity;
+  return color;
+}
+
+function text(value) {
+  if (value == -1) return '';
+  if (value == 'X') return 'X';
+  if (value == keepAlive) return 'K';
+
+  return String.fromCharCode('A'.charCodeAt(0) + value)
+}
+
+function resetGraph(isHit, arrows) {
+  const data = graphData[isHit ? 'hit' : 'miss'];
+  data.arrows = arrows;
+
+  generateMemoryAccessPattern(data.pattern, isHit);
+
+  var cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree")
+    .append("svg")
+      .attr("width", width)
+      .attr("height", height);
+
+  var defs = cacheSvg.append('defs');
+  defs.append('marker')
+    .attr('id', 'arrow')
+    .attr("viewBox", "0 -5 10 10")
+    .attr("refX", 9)
+    .attr("markerWidth", 7)
+    .attr("markerHeight", 7)
+    .attr("orient", "auto")
+    .append('path')
+      .attr('d', 'M0,-5L10,0L0,5');
+  defs.append('marker')
+    .attr('id', 'arrowHighlight')
+    .attr("viewBox", "0 -5 10 10")
+    .attr("refX", 9)
+    .attr("markerWidth", 7)
+    .attr("markerHeight", 7)
+    .attr("orient", "auto")
+    .append('path')
+      .attr('d', 'M0,-5L10,0L0,5')
+      .attr('fill', 'red');
+
+  data.nodes = [];
+  for (let row = 0; row < rows; row++) {
+    const columns = Math.pow(2, row);
+    for (let column = 0; column < columns; column++) {
+      data.nodes.push({
+        row,
+        column,
+        value: -1,
+        fill: row == rows-1 ? 'darkgray' : 'white',
+        stroke: 'black',
+        strokeWidth: 1
+      });
+    }
+  }
+
+  const nodeGroup = cacheSvg.selectAll('g')
+    .data(data.nodes)
+    .enter().append('g');
+  nodeGroup.append('circle')
+    .attr('cx', d => calcNodeX(d, width))
+    .attr('cy', d => calcNodeY(d, height, rows))
+    .attr('r', nodeWidth/2)
+    .attr('stroke', d => d.stroke)
+    .attr('stroke-width', d => d.strokeWidth)
+    .attr('fill', d => d.fill);
+  nodeGroup.append('text')
+    .attr('x', d => calcNodeX(d, width)-10)
+    .attr('y', d => calcNodeY(d, height, rows)+10)
+    .attr('font-weight', d => (d == 'X' || d == keepAlive) ? 'bolder' : 'lighter')
+    .attr('font-size', 'xx-large')
+    .text(d => text(d.value));
+
+
+  cacheSvg.selectAll('line')
+    .data(data.arrows)
+    .enter().append('line')
+      .attr('x1', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).x1)
+      .attr('y1', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).y1)
+      .attr('x2', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).x2)
+      .attr('y2', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).y2)
+      .attr('stroke', d => d.stroke)
+      .attr('stroke-width', 2)
+      .attr('marker-end', d => `url(#${d.marker})`);
+
+  const rowLength = 32;
+  const elementWidth = width/rowLength;
+
+  var memoryAccessSvg = d3.select(isHit ? "#hitPipeline" : "#missPipeline")
+    .append("svg")
+      .attr("width", elementWidth * rowLength)
+      .attr("height", elementWidth);
+
+  const memoryAccessData = data.pattern.slice(0, rowLength);
+  while (memoryAccessData.length < rowLength) memoryAccessData.push(-1);
+
+  const accessGroup = memoryAccessSvg.selectAll('g')
+    .data(memoryAccessData)
+    .enter().append('g');
+  accessGroup.append('rect')
+    .attr('x', (d, i) => i*elementWidth)
+    .attr('y', '0')
+    .attr('width', elementWidth)
+    .attr('height', elementWidth)
+    .attr('stroke', 'black')
+    .attr('fill', d => color(d));
+  accessGroup.append('text')
+    .attr('x', (d, i) => i*elementWidth + 6)
+    .attr('y', 18)
+    .attr('font-weight', d => (d == 'X' || d == keepAlive) ? 'bolder' : 'lighter')
+    .attr('font-size', 'larger')
+    .text(text);
+}
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+function reset() {
+  d3.selectAll("svg").remove();
+
+  cacheWays = document.getElementById('simplified').checked ? 4 : 8;
+  keepAlive = cacheWays/2;
+  nodeWidth = (width / cacheWays) * 0.4;
+  rows = Math.log2(cacheWays)+1;
+
+  const arrows = generateRandomArrows(rows);
+  resetGraph(true, deepClone(arrows));
+  resetGraph(false, deepClone(arrows));
+}
+
+function arrowIndex(arrows, row, column) {
+  for (let i = 0; i < arrows.length; i++) {
+    const node = arrows[i].from;
+    if (node.row == row && node.column == column) return i;
+  }
+  throw 'arrow not found';
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function highlightArrows(isHit, arrows) {
+  let node = {
+    row: 0,
+    column: 0
+  };
+
+  for (let row = 0; row < rows-1; row++) {
+    const arrow = arrows[arrowIndex(arrows, node.row, node.column)];
+    node = arrow.to;
+    arrow.stroke = 'red';
+    arrow.marker = 'arrowHighlight';
+  }
+
+  var cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree").select('svg');
+  return new Promise(r =>
+    cacheSvg.selectAll('line')
+      .data(arrows)
+      .transition()
+        .duration(0)
+        .attr('stroke', d => d.stroke)
+        .attr('marker-end', d => `url(#${d.marker})`)
+      .on('end', r)
+  );
+}
+
+function unhighlightArrows(isHit, arrows) {
+  for (const arrow of arrows) {
+    arrow.stroke = 'black';
+    arrow.marker = 'arrow';
+  }
+
+  var cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree").select('svg');
+  return new Promise(r =>
+    cacheSvg.selectAll('line')
+      .data(arrows)
+      .transition()
+        .duration(0)
+        .attr('stroke', d => d.stroke)
+        .attr('marker-end', d => `url(#${d.marker})`)
+      .on('end', r)
+  );
+}
+
+function arrowOnPathToNode(arrow, node) {
+  let row = node.row;
+  let column = node.column;
+  while (row > arrow.to.row) {
+    column = Math.floor(column/2);
+    row--;
+  }
+  return column == arrow.to.column;
+}
+
+function updateArrows(isHit, arrows, accessedNode, duration) {
+  let node = {
+    row: 0,
+    column: 0
+  };
+
+  const targetColumn = accessedNode.column;
+  const maxColumns = Math.pow(2, rows-1);
+
+  for (let row = 0; row < rows-1; row++) {
+    const arrow = arrows[arrowIndex(arrows, node.row, node.column)];
+    const nextColumns = Math.pow(2, row+1);
+    const nextColumn = Math.floor(targetColumn/(maxColumns/nextColumns));
+    arrow.to.column = nextColumn^1;
+    node = {
+      row: row+1,
+      column: nextColumn
+    }
+  }
+
+  var cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree").select('svg');
+  return new Promise(r =>
+    cacheSvg.selectAll('line')
+      .data(arrows)
+      .transition()
+        .duration(duration)
+        .attr('x1', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).x1)
+        .attr('y1', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).y1)
+        .attr('x2', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).x2)
+        .attr('y2', d => calcArrowCoordinates(d, width, height, rows, nodeWidth).y2)
+      .on('end', r)
+  );
+}
+
+function getNodeForValue(nodes, value) {
+  for (const node of nodes) {
+    if (node.row != rows-1) continue;
+    if (node.value == value) return node;
+  }
+  return undefined;
+}
+
+function valueInCache(nodes, value) {
+  return getNodeForValue(nodes, value) != undefined;
+}
+
+function nodeToEvict(nodes, arrows) {
+  let target = {
+    row: 0,
+    column: 0
+  };
+  for (let row = 0; row < rows-1; row++) {
+    const arrow = arrows[arrowIndex(arrows, target.row, target.column)];
+    target = arrow.to;
+  }
+  for (const node of nodes) {
+    if (node.row == target.row && node.column == target.column) return node;
+  }
+  throw 'node target not in nodes';
+}
+
+function evict(isHit, nodes, toEvict, value, duration) {
+  toEvict.value = value;
+  toEvict.fill = color(value);
+  var cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree").select('svg');
+
+  const newNodes = cacheSvg.selectAll('g')
+    .data(nodes);
+
+  const promises = [];
+  promises.push(new Promise(r =>
+    newNodes.transition().duration(0).select('circle')
+      .attr('fill', d => d.fill)
+      .on('end', r))
+  );
+
+  promises.push(new Promise(r =>
+    newNodes.transition().duration(0).select('text')
+    .attr('font-weight', d => (d.value == 'X' || d.value == keepAlive) ? 'bolder' : 'lighter')
+    .text(d => text(d.value))
+    .on('end', r))
+  );
+
+  return Promise.all(promises);
+}
+
+function highlightNode(isHit, nodes, node) {
+  node.stroke = 'red';
+  node.strokeWidth = 4;
+  const cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree").select('svg');
+  return new Promise(r =>
+    cacheSvg.selectAll('circle')
+      .data(nodes)
+      .transition()
+        .duration(0)
+        .attr('stroke', d => d.stroke)
+        .attr('stroke-width', d => d.strokeWidth)
+        //.attr('fill', d => (d.row == node.row && d.column == node.column) ? 'white' : d.fill)
+      .on('end', r)
+  );
+}
+
+function unhighlightNodes(isHit, nodes) {
+  for (const node of nodes) {
+    node.stroke = 'black';
+    node.strokeWidth = 1;
+  }
+  const cacheSvg = d3.select(isHit ? "#hitTree" : "#missTree").select('svg');
+  return new Promise(r =>
+    cacheSvg.selectAll('circle')
+      .data(nodes)
+      .transition()
+        .duration(0)
+        .attr('stroke', d => d.stroke)
+        .attr('stroke-width', d => d.strokeWidth)
+        //.attr('fill', d => d.fill)
+      .on('end', r)
+  );
+}
+
+
+function updateMemoryAccess(isHit) {
+  const memoryAccesses = graphData[isHit ? 'hit' : 'miss'].pattern;
+  const memoryAccessSvg = d3.select(isHit ? "#hitPipeline" : '#missPipeline').select('svg');
+
+  const newAccesses = memoryAccessSvg.selectAll('g')
+    .data(memoryAccesses);
+
+  newAccesses.exit().select('rect')
+    .attr('fill', d => color(-1));
+  newAccesses.exit().select('text')
+    .text('');
+
+  const promises = [];
+  if (memoryAccesses.length) {
+    promises.push(new Promise(r =>
+      newAccesses.transition().duration(0).select('rect')
+      .attr('fill', d => color(d))
+      .on('end', r))
+    );
+
+    promises.push(new Promise(r =>
+      newAccesses.transition().duration(0).select('text')
+      .attr('font-weight', d => (d == 'X' || d == keepAlive) ? 'bolder' : 'lighter')
+      .text(text)
+      .on('end', r))
+    );
+  }
+
+  return Promise.all(promises);
+}
+
+async function stepGraph(isHit) {
+  const data = graphData[isHit ? 'hit' : 'miss'];
+  if (data.pattern.length == 0) return;
+
+  const speed = document.getElementById('speed').value;
+  const memoryAccess = data.pattern.shift();
+  await updateMemoryAccess(isHit);
+  if (memoryAccess == -1) return;
+
+
+  if (valueInCache(data.nodes, memoryAccess)) {
+    const accessedNode = getNodeForValue(data.nodes, memoryAccess);
+    await highlightNode(isHit, data.nodes, accessedNode);
+    await sleep(2000/speed);
+    await unhighlightNodes(isHit, data.nodes);
+    await sleep(500/speed);
+    await updateArrows(isHit, data.arrows, accessedNode, 1000/speed);
+  } else {
+    await highlightArrows(isHit, data.arrows);
+    await sleep(8000/speed);
+    const toEvict = nodeToEvict(data.nodes, data.arrows);
+    if (toEvict.value == 'X') {
+      debugPrint(toEvict);
+      debugPrint(data.nodes);
+      debugPrint(data.arrows);
+      throw 'foo';
+    }
+    await evict(isHit, data.nodes, toEvict, memoryAccess, 1000/speed);
+    await sleep(1000/speed);
+    await unhighlightArrows(isHit, data.arrows);
+    await sleep(500/speed);
+    await updateArrows(isHit, data.arrows, toEvict, 1000/speed);
+  }
+}
+
+async function playGraph(isHit) {
+  const data = graphData[isHit ? 'hit' : 'miss'];
+  while (data.pattern.length > 0) {
+    await stepGraph(isHit);
+  }
+}
+
+function disableButtons() {
+  document.getElementById('resetButton').disabled = true;
+  document.getElementById('stepButton').disabled = true;
+  document.getElementById('playButton').disabled = true;
+}
+
+function enableButtons() {
+  document.getElementById('resetButton').disabled = false;
+  document.getElementById('stepButton').disabled = false;
+  document.getElementById('playButton').disabled = false;
+}
+
+async function step() {
+  disableButtons();
+  await Promise.all([stepGraph(true), stepGraph(false)]);
+  enableButtons();
+}
+async function play() {
+  disableButtons();
+  await Promise.all([playGraph(true), playGraph(false)]);
+  enableButtons();
+}
+
+window.onload = () => {
+  reset();
+};
+</script>

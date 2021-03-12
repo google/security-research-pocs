@@ -1,0 +1,280 @@
+{#
+Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+<!doctype html>
+<html>
+
+<head>
+  <title>Spectre</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://d3js.org/d3.v4.js"></script>
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=Crimson+Text&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500&display=swap" rel="stylesheet">
+
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:site" content="@_tsuro" />
+  <meta name="twitter:title" content="Spectre in JavaScript" />
+  <meta name="twitter:description" content="A Spectre demo written in JavaScript for Chrome 88." />
+  <meta name="twitter:image" content="https://leaky.page/preview.png" />
+</head>
+
+<body>
+
+<script>
+function toggleMenu() {
+  const menu = document.getElementById("menu");
+  if (menu.style.display == 'none') {
+    menu.style.display = '';
+    sessionStorage.setItem('menuEnabled', true);
+  } else {
+    menu.style.display = 'none';
+    sessionStorage.setItem('menuEnabled', false);
+  }
+}
+
+const parameters = [
+  {
+    name: "reps",
+    section: "timer",
+    description: "Cache timer repetitions",
+    type: "number",
+    initialValue: 4000,
+    tooltip: "A larger value will result in a bigger timing difference for the cache timer. Remember to run the calibration step again if you change this value."
+  },
+  {
+    name: "cache_threshold",
+    section: "timer",
+    description: "Cache timing threshold in ms",
+    type: "number",
+    initialValue: 0.13,
+    tooltip: "What threshold to use to decide between a cache hit and a miss. Needs to be adjusted when you change the timer repetitions."
+  },
+  {
+    name: "stable_timer",
+    section: "timer",
+    description: "Use stable timer",
+    type: "checkbox",
+    initialValue: "checked",
+    tooltip: "The stable timer variant will have a lower timing difference but have fewer false negatives."
+  },
+  {% if macos %}
+  {
+    name: "m1_cpu",
+    section: "timer",
+    description: "M1 CPU",
+    type: "checkbox",
+    initialValue: "unchecked",
+    tooltip: "Check this if you're running an Apple M1 CPU."
+  },
+  {% endif %}
+  {
+    name: "measurements",
+    section: "memory",
+    description: "Array memory layout measurements",
+    type: "number",
+    initialValue: 128,
+    tooltip: "The number of array indices to measure to infer the memory layout. Try to increase this if the infer step fails frequently."
+  },
+  {
+    name: "measurement_reps",
+    section: "memory",
+    description: "Array memory layout measurement repetitions",
+    type: "number",
+    initialValue: 1,
+    tooltip: "How often to test every array index."
+  },
+  {
+    name: "training_reps",
+    section: "spectre",
+    description: "Branch predictor training count",
+    type: "number",
+    initialValue: 2,
+    tooltip: "How often to run the spectre gadget using an in bound offset to train the branch predictor."
+  },
+  {
+    name: "gadget_loop_reps",
+    section: "spectre",
+    description: "Branch predictor state loop count",
+    type: "number",
+    initialValue: 200,
+    tooltip: "The spectre gadget includes an empty loop to control the global branch predictor state. This value controls the repetitions."
+  },
+  {
+    name: "eviction_list_size",
+    section: "spectre",
+    description: "List size for cache eviction",
+    type: "number",
+    initialValue: 200,
+    tooltip: "To evict the array length from the cache we traverse a linked list. This value controls how many entries that list has."
+  },
+  {
+    name: "min_leak_reps",
+    section: "spectre",
+    description: "Minimum spectre gadget runs",
+    type: "number",
+    initialValue: 1,
+    tooltip: "The spectre gadget will be run this many times to test for a zero or one bit each. The resulting bit is the one that showed more hits."
+  },
+  {
+    name: "max_leak_reps",
+    section: "spectre",
+    description: "Maximum spectre gadget runs",
+    type: "number",
+    initialValue: 5,
+    tooltip: "If we get the same number of hits after the minimum number of gadget runs, repeat up to a maximum until we observe a difference."
+  }
+];
+
+function onParameterChange(event) {
+  switch (event.target.type) {
+    case 'number':
+      sessionStorage.setItem(event.target.id, event.target.value);
+      break;
+    case 'checkbox':
+      sessionStorage.setItem(event.target.id, event.target.checked ? 'checked' : 'unchecked');
+      break;
+  }
+}
+
+function setParameter(name, value) {
+  document.getElementById(name).value = value.toFixed(3);
+  sessionStorage.setItem(name, value.toFixed(3));
+}
+
+function enableParameters(section, addDescription) {
+  for (const param of parameters) {
+    if (param.section != section) continue;
+    document.getElementById(param.name).disabled = false;
+    if (addDescription) {
+      const row = document.createElement('tr');
+      const label = document.createElement('td');
+      label.innerText = param.description + ':';
+      label.className = 'paramLabel';
+      const description = document.createElement('td');
+      description.innerText = param.tooltip;
+      description.className = 'paramDescription';
+      row.appendChild(label);
+      row.appendChild(description);
+      document.getElementById('paramTable').appendChild(row);
+    }
+  }
+}
+
+function onResetButtonClick(event) {
+  parameterName = event.target.dataset.parameterName;
+  initialValue = event.target.dataset.initialValue;
+  sessionStorage.removeItem(parameterName);
+  document.getElementById(parameterName).value = initialValue;
+}
+
+window.onload = () => {
+  const menu = document.getElementById('menu');
+  const timerMenu = document.getElementById('timerMenu');
+  const memoryMenu = document.getElementById('memoryMenu');
+  const spectreMenu = document.getElementById('spectreMenu');
+  for (const param of parameters) {
+    const div = document.createElement('div');
+    div.title = param.tooltip;
+    div.className = "menuitem";
+
+    const label = document.createElement('label');
+    label.for = param.name;
+    label.innerText = param.description + ": ";
+
+    const input = document.createElement('input');
+    input.id = param.name;
+    input.type = param.type;
+    input.disabled = true;
+    let value = sessionStorage.getItem(param.name);
+    if (!value) {
+      value = param.initialValue;
+    }
+    switch (input.type) {
+      case 'number':
+        input.value = value;
+        break;
+      case 'checkbox':
+        input.checked = value == 'checked';
+        break;
+    }
+    input.onchange = onParameterChange;
+
+    const resetButton = document.createElement('button');
+    resetButton.innerText = 'reset';
+    resetButton.dataset.parameterName = param.name;
+    resetButton.dataset.initialValue = param.initialValue;
+    resetButton.onclick = onResetButtonClick;
+
+    div.appendChild(label);
+    div.appendChild(input);
+    div.appendChild(resetButton);
+
+    switch (param.section) {
+      case 'timer':
+        timerMenu.appendChild(div);
+        break;
+      case 'memory':
+        memoryMenu.appendChild(div);
+        break;
+      case 'spectre':
+        spectreMenu.appendChild(div);
+        break;
+    }
+  }
+
+  const menuEnabled = sessionStorage.getItem('menuEnabled');
+  if (menuEnabled === 'true') {
+    menu.style.display = '';
+  }
+
+  if (typeof(this.init) == 'function') init();
+};
+
+</script>
+
+{% block script %}{% endblock %}
+
+<button id="menubutton" onclick="toggleMenu()">=</button>
+
+<div class="container">
+
+<div class="main">
+<div class="content">
+  {% block content %}{% endblock %}
+</div>
+<div id="menu" class="menu" style="display: none;">
+  <div id="timerMenu">
+    <h2>Timer options</h2>
+  </div>
+  <div id="memoryMenu">
+    <h2>Memory layout inference</h2>
+  </div>
+  <div id="spectreMenu">
+    <h2>Spectre options</h2>
+  </div>
+</div>
+</div>
+
+<div class="navigation">
+  <button id="prevButton" disabled=true>prev</button>
+  <button id="nextButton" disabled=true>next</button>
+</div>
+
+</div>
+
+</body>
+</html>

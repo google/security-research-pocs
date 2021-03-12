@@ -1,0 +1,67 @@
+{#
+Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+{% extends 'base.html' %}
+
+{% block script %}
+
+<script>
+
+// gets called by onload
+function init() {
+  const nextButton = document.getElementById('nextButton');
+  nextButton.onclick = () => {
+    location = '/timer.html';
+  };
+  nextButton.disabled = false;
+}
+
+</script>
+{% endblock %}
+
+{% block content %}
+
+<div class=center>
+<h1> Spectre </h1>
+
+<p>
+  This site hosts a proof of concept for the <a href="https://en.wikipedia.org/wiki/Spectre_(security_vulnerability)" target="_blank">Spectre</a> vulnerability written in JavaScript.
+  It was developed and optimized for Chrome&nbsp;88 running on an Intel® Core™ i7-6500U processor on Linux.
+  While it was confirmed to work on other CPUs (different vendor and/or generation), operating systems and Chromium flavors, you might have to adjust the configuration and it might work less reliably (or not at all).
+  Note that the goal of this proof of concept is to demonstrate the feasibility of a web-based Spectre exploit. It is not a test to see if your device is vulnerable or not.
+  All code is public, you can find it on <a href="https://github.com/google/security-research-pocs/tree/master/spectre.js" target="_blank">GitHub</a>.
+</p>
+<p>
+  This demo is split into three parts:
+  <ol>
+    <li>Calibrating the timer to observe side effects of the CPU's speculative execution.</li>
+    <li>A demonstration that infers the memory layout of a JavaScript array.</li>
+    <li>The Spectre proof of concept itself, leaking memory of your browser's renderer process.</li>
+  </ol>
+</p>
+<p>
+  If you want to learn more about the impact on the web and how to protect your website, please check out our <a href="/blog" target="_blank">blog post</a>.
+</p>
+<p>
+  When you're ready, click the <i>next</i> button on the bottom right to start.
+</p>
+<p>
+  Spoiler: what a <a href="https://youtu.be/V_9cQP60ZGI" target="_blank">successful demo</a> looks like.
+</p>
+
+</div>
+
+{% endblock %}
